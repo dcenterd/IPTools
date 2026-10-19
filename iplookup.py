@@ -20,7 +20,8 @@ Usage
     Enter IP address: 8.8.8.8
 
 Output
-    Printed on screen, and saved as AS<number>_prefixes.txt in the current
+    Printed on screen (the announced prefix containing the queried IP is
+    shown in red when output is a terminal), and saved as AS<number>_prefixes.txt in the current
     directory (for example AS15169_prefixes.txt).
 
 Data source
@@ -222,8 +223,16 @@ def main():
     print(f"ANNOUNCED IPv4 PREFIXES ({len(ipv4_prefixes)})")
     print("=" * 60)
 
+    # Highlight in red the prefix(es) that contain the queried IP (only when
+    # printing to a terminal, so piped output stays free of escape codes).
+    ip_obj = ipaddress.ip_address(ip)
+    use_color = sys.stdout.isatty()
+
     for p in ipv4_prefixes:
-        print(p)
+        if use_color and ip_obj in ipaddress.ip_network(p, strict=False):
+            print(f"\033[31m{p}  <-- {ip}\033[0m")
+        else:
+            print(p)
 
     # ---------------------------------------------------------
     # 6. Display IPv6 prefixes

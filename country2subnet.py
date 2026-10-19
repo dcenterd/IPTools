@@ -20,14 +20,14 @@ Usage
     Countries are 2-letter ISO 3166-1 codes (IR, DE, US, GB, ...).
     Use GB for the United Kingdom, not UK.
 
-Output (in ~/iplookup-results/, one pair of files per country)
+Output (in ./iplookup-results/, one pair of files per country)
     <cc>_ipv4_prefixes.txt    one prefix per line
     <cc>_ipv4_mikrotik.rsc    MikroTik commands, address-list name = <cc>
                               (e.g. /ip firewall address-list add list=ir ...)
 
 Data source
     https://ftp.ripe.net/pub/stats/<registry>/delegated-<registry>-extended-latest
-    Downloads (about 45 MB in total) are cached in ~/iplookup-results/.cache
+    Downloads (about 45 MB in total) are cached in ./iplookup-results/.cache
     for 12 hours.
 
 Note
@@ -61,7 +61,7 @@ SOURCES = {
     "AFRINIC":  f"{BASE_URL}/afrinic/delegated-afrinic-extended-latest",
 }
 
-OUTPUT_DIR = os.path.expanduser("~/iplookup-results")
+OUTPUT_DIR = os.path.abspath("iplookup-results")  # in the current directory
 CACHE_DIR = os.path.join(OUTPUT_DIR, ".cache")
 CACHE_MAX_AGE = 12 * 3600  # seconds
 
@@ -198,6 +198,7 @@ def save_results(country, networks):
     with open(txt_file, "w") as f:
 
         f.write(f"# {country} IPv4 prefixes\n")
+        f.write(f"# Total subnets: {len(networks)}\n")
         f.write(f"# Updated: {now}\n\n")
 
         for network in networks:
@@ -207,6 +208,7 @@ def save_results(country, networks):
     with open(rsc_file, "w") as f:
 
         f.write(f"# {country} IPv4 address list\n")
+        f.write(f"# Total subnets: {len(networks)}\n")
         f.write(f"# Updated: {now}\n\n")
 
         for network in networks:

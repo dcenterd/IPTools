@@ -17,11 +17,12 @@ Most scripts query public data sources ([RIPEstat](https://stat.ripe.net), the R
 | `mikrotik_subnet_updater.py` | Syncs a country's prefix list into a MikroTik firewall address-list through the RouterOS REST API (adds missing, removes stale, asks before changing anything). |
 | `ripe_ip_checker.py` | Pre-purchase due-diligence report for IPv4 ranges in the RIPE region: ownership, transfers, routing history, RPKI/IRR, reputation, geolocation, past usage, compliance and fragmentation. |
 | `ssl_checker.py` | Checks the SSL/TLS certificate of one or many websites: expiry, invalid/self-signed/wrong-host certificates, missing intermediate (incomplete chain) and DNS failures. Shows a table with issuer and days left, can alert by webhook or e-mail, run on a schedule in the background, and dump certificates as PEM plus decoded text. |
+| `cve_checker.py` | Latest published CVEs from NVD and CIRCL, ranked by real-world risk: CISA KEV (exploited now) first, then EPSS exploitation probability, then CVSS score. Filter by days, keyword, severity or score; table or JSON output. |
 
 ## Requirements
 
 - Python 3.8+
-- `requests` (all scripts except `ripe_ip_checker.py` and `ssl_checker.py`, which use only the standard library)
+- `requests` (all scripts except `ripe_ip_checker.py`, `ssl_checker.py` and `cve_checker.py`, which use only the standard library)
 
 ```sh
 git clone https://github.com/dcenterd/IPTools.git
@@ -60,6 +61,11 @@ pip install -r requirements.txt
 ./ssl_checker.py github.com example.org:8443
 ./ssl_checker.py -f sites.txt --warn-days 30 --dump-cert certs
 ./ssl_checker.py -f sites.txt --every 6h --background --webhook <url>
+
+# newest CVEs, riskiest first
+./cve_checker.py --days 7 --severity high
+./cve_checker.py --keyword "PHP before" --days 30
+./cve_checker.py --kev                     # only actively exploited
 ```
 
 ### Country list to MikroTik

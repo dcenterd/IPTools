@@ -14,6 +14,9 @@ Run repeatedly / in the background:
   ssl_checker.py -f sites.txt --every 6h --background       (every 6 hours, until killed)
   ssl_checker.py -f sites.txt --at 09:00 --for 30d --background   (daily at 09:00 for 30 days)
 
+NOTE: --background only works on Linux/Unix (it uses fork). On Windows, run the script in a
+foreground terminal or use Task Scheduler instead.
+
 Exit code: 0 = all OK, 1 = at least one WARNING/EXPIRED/INVALID/ERROR.
 Suitable for cron:  0 */6 * * * /usr/bin/python3 /path/ssl_checker.py -f sites.txt --webhook URL
 
@@ -342,7 +345,7 @@ def main():
                       help="repeat the check every day at this local time (24h)")
     sched.add_argument("--for", dest="run_for", type=parse_duration, metavar="DURATION",
                        help="stop scheduling after this long, e.g. 7d (default: run until killed)")
-    sched.add_argument("--background", action="store_true", help="detach and run in the background")
+    sched.add_argument("--background", action="store_true", help="detach and run in the background (Linux/Unix only)")
     sched.add_argument("--log-file", default="ssl_checker.log", help="background output file (default ssl_checker.log)")
     sched.add_argument("--pid-file", default="ssl_checker.pid", help="background PID file (default ssl_checker.pid)")
     args = p.parse_args()
@@ -352,6 +355,8 @@ def main():
     if args.run_for and not (args.every or args.at):
         p.error("--for needs --every or --at")
 
+    if args.background and not hasattr(os, "fork"):
+        p.error("--background only works on Linux/Unix; run in a terminal or use Task Scheduler instead")
     if args.background:
         args.log_file, args.pid_file = os.path.abspath(args.log_file), os.path.abspath(args.pid_file)
         if args.file:

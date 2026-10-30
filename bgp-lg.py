@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""
+bgp-lg.py - BGP looking glass: the AS path towards an IP (RIPEstat bgp-state)
+
+Usage
+    ./bgp-lg.py 8.8.8.8              # path, text topology and bgp_path_<ip>.pdf
+    ./bgp-lg.py 8.8.8.8 --no-pdf     # do not write the PDF
+    ./bgp-lg.py 8.8.8.8 --json       # one JSON document on stdout, for scripts
+
+With --json the text topology is not printed, no PDF is written unless --pdf is
+given, progress and warnings go to stderr, and errors become {"error": ...}
+with exit code 1.
+"""
+import argparse
+import ipaddress
+import json
 import re
 import sys
 
@@ -9,11 +24,20 @@ PDF_SCALE = 1.0  # 1.0 = original size
 RIPE_AS_API = "https://stat.ripe.net/data/as-overview/data.json"
 
 
+def ripe_get(url, resource, timeout):
+    """GET a RIPEstat endpoint as JSON, with one retry (the API occasionally times out)."""
+    for attempt in (1, 2):
+        try:
+            r = requests.get(url, params={"resource": resource}, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError):
+            if attempt == 2:
+                raise
+
+
 def get_bgp_path(ip):
-    params = {"resource": ip}
-    r = requests.get(RIPE_BGP_API, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    data = ripe_get(RIPE_BGP_API, ip, 10)
 
     paths = data["data"]["bgp_state"]
     if not paths:
@@ -23,10 +47,7 @@ def get_bgp_path(ip):
 
 
 def get_as_name(asn):
-    params = {"resource": f"AS{asn}"}
-    r = requests.get(RIPE_AS_API, params=params, timeout=10)
-    r.raise_for_status()
-    payload = r.json()
+    payload = ripe_get(RIPE_AS_API, f"AS{asn}", 10)
     holder = payload.get("data", {}).get("holder")
     return holder or f"AS{asn}"
 
@@ -135,25 +156,56 @@ def export_pdf(ip, path, names):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: bgp-lg.py <ip>")
-        sys.exit(1)
+    ap = argparse.ArgumentParser(description="BGP AS path towards an IP (RIPEstat looking glass).")
+    ap.add_argument("ip", help="IPv4 or IPv6 address")
+    ap.add_argument("--json", action="store_true", help="print one JSON document instead of the text report")
+    ap.add_argument("--no-pdf", action="store_true", help="do not write the PDF")
+    ap.add_argument("--pdf", action="store_true", help="with --json: also write the PDF")
+    args = ap.parse_args()
 
-    ip = sys.argv[1]
-    print(f"\n BGP AS Path for {ip}\n")
+    def fail(msg):
+        print(json.dumps({"error": msg}) if args.json else f"Error: {msg}")
+        return 1
 
-    path = get_bgp_path(ip)
+    try:
+        ipaddress.ip_address(args.ip)
+    except ValueError:
+        return fail(f"'{args.ip}' is not a valid IP address")
+    ip = args.ip
+
+    if not args.json:
+        print(f"\n BGP AS Path for {ip}\n")
+
+    try:
+        path = get_bgp_path(ip)
+    except (requests.RequestException, KeyError, ValueError) as e:
+        return fail(f"could not fetch the BGP path ({e})")
+    except Exception as e:  # get_bgp_path raises a plain Exception when RIPEstat has no path
+        return fail(str(e))
 
     names = []
     for i, asn in enumerate(path, 1):
-        name = get_as_name(asn)
+        try:
+            name = get_as_name(asn)
+        except (requests.RequestException, ValueError):
+            name = f"AS{asn}"
         names.append(name)
-        print(f"{i}. AS{asn} — {name}")
+        if not args.json:
+            print(f"{i}. AS{asn} — {name}")
+
+    write_pdf = not args.no_pdf and (args.pdf or not args.json)
+    pdf = export_pdf(ip, path, names) if write_pdf else None
+
+    if args.json:
+        print(json.dumps({"ip": ip, "path": [{"asn": f"AS{a}", "name": n} for a, n in zip(path, names)], "pdf": pdf},
+                         indent=2, ensure_ascii=False))
+        return 0
 
     draw_as_graph(path, names)
-
-    print(f"PDF saved to {export_pdf(ip, path, names)}")
+    if pdf:
+        print(f"PDF saved to {pdf}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

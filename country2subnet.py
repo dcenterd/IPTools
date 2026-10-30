@@ -16,6 +16,9 @@ Usage
     country2subnet.py IR AM TR        # several countries
     country2subnet.py IR,AM,TR        # commas work too
     country2subnet.py --refresh DE    # ignore the cached downloads
+    country2subnet.py IR --json       # one JSON document on stdout, for scripts
+    country2subnet.py IR --output-dir /srv/lists   # write the files elsewhere
+    country2subnet.py IR --json --no-save          # do not write any files
 
     Countries are 2-letter ISO 3166-1 codes (IR, DE, US, GB, ...).
     Use GB for the United Kingdom, not UK.
@@ -30,6 +33,12 @@ Data source
     Downloads (about 45 MB in total) are cached in ./iplookup-results/.cache
     for 12 hours.
 
+JSON mode
+    --json prints a single JSON document ({"countries": {"IR": {"found", "count",
+    "addresses", "prefixes", "files"}}}) and never prompts. Download progress and
+    warnings go to stderr; errors become {"error": ...} with exit code 1. The
+    prefix files are still written (unless --no-save) and listed under "files".
+
 Note
     These lists show where address space is registered, which is not always
     where the addresses are used or geolocated.
@@ -40,6 +49,7 @@ Requirements
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import sys
@@ -64,6 +74,11 @@ SOURCES = {
 OUTPUT_DIR = os.path.abspath("iplookup-results")  # in the current directory
 CACHE_DIR = os.path.join(OUTPUT_DIR, ".cache")
 CACHE_MAX_AGE = 12 * 3600  # seconds
+JSON_MODE = False          # set by --json: progress goes to stderr so stdout stays a single JSON document
+
+
+def progress(msg=""):
+    print(msg, file=sys.stderr if JSON_MODE else sys.stdout)
 
 
 def parse_countries(values):
@@ -78,7 +93,7 @@ def parse_countries(values):
             code = code.upper()
 
             if not re.fullmatch(r"[A-Z]{2}", code):
-                sys.exit(
+                raise ValueError(
                     f"'{code}' is not a 2-letter country code. "
                     "Examples: IR, DE, US, GB"
                 )
@@ -98,7 +113,10 @@ def ask_countries():
     print()
 
     while True:
-        answer = input("Enter country code(s): ").strip()
+        try:
+            answer = input("Enter country code(s): ").strip()
+        except EOFError:
+            raise ValueError("no country code given")
 
         if answer:
             return parse_countries([answer])
@@ -114,10 +132,10 @@ def fetch(name, url, refresh):
         and os.path.exists(path)
         and time.time() - os.path.getmtime(path) < CACHE_MAX_AGE
     ):
-        print(f"  {name:9} using cached copy")
+        progress(f"  {name:9} using cached copy")
         return path
 
-    print(f"  {name:9} downloading...")
+    progress(f"  {name:9} downloading...")
 
     tmp = path + ".part"
 
@@ -138,7 +156,7 @@ def get_ipv4(countries, refresh=False):
     wanted = set(countries)
     found = defaultdict(set)
 
-    print("Loading RIR delegated statistics...")
+    progress("Loading RIR delegated statistics...")
 
     for name, url in SOURCES.items():
         path = fetch(name, url, refresh)
@@ -222,6 +240,7 @@ def save_results(country, networks):
 
 
 def main():
+    global OUTPUT_DIR, CACHE_DIR, JSON_MODE
 
     parser = argparse.ArgumentParser(
         description="Build IPv4 prefix lists for one or more countries.",
@@ -238,20 +257,71 @@ def main():
         action="store_true",
         help="ignore cached downloads and fetch fresh data",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one JSON document instead of the text report (never prompts)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        metavar="DIR",
+        help="folder for the prefix files and the download cache (default: ./iplookup-results)",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="do not write the .txt / .rsc files",
+    )
     args = parser.parse_args()
 
-    print("=" * 60)
-    print(" Country IPv4 Prefix Updater")
-    print("=" * 60)
+    JSON_MODE = args.json
+    if args.output_dir:
+        OUTPUT_DIR = os.path.abspath(args.output_dir)
+        CACHE_DIR = os.path.join(OUTPUT_DIR, ".cache")
 
-    countries = (
-        parse_countries(args.countries) if args.countries else ask_countries()
-    )
+    def fail(msg):
+        print(json.dumps({"error": msg}) if args.json else msg)
+        return 1
 
-    print()
-    results = get_ipv4(countries, refresh=args.refresh)
+    if not args.json:
+        print("=" * 60)
+        print(" Country IPv4 Prefix Updater")
+        print("=" * 60)
+
+    try:
+        if args.countries:
+            countries = parse_countries(args.countries)
+        elif args.json:
+            return fail("at least one country code is required with --json")
+        else:
+            countries = ask_countries()
+
+        if not args.json:
+            print()
+        results = get_ipv4(countries, refresh=args.refresh)
+    except ValueError as e:
+        return fail(str(e))
+    except (requests.RequestException, OSError) as e:
+        return fail(f"could not download the RIR statistics ({e})")
+
+    report = {}
 
     for country, networks in results.items():
+
+        files = None
+        if networks and not args.no_save:
+            files = save_results(country, networks)
+
+        report[country] = {
+            "found": bool(networks),
+            "count": len(networks),
+            "addresses": sum(n.num_addresses for n in networks),
+            "prefixes": [str(n) for n in networks],
+            "files": {"txt": files[0], "rsc": files[1]} if files else None,
+        }
+
+        if args.json:
+            continue
 
         print()
         print("-" * 60)
@@ -265,12 +335,11 @@ def main():
 
         print(f"{country}: found {len(networks)} IPv4 prefixes.")
 
-        txt_file, rsc_file = save_results(country, networks)
-
-        print()
-        print("Files created:")
-        print(f"  {txt_file}")
-        print(f"  {rsc_file}")
+        if files:
+            print()
+            print("Files created:")
+            print(f"  {files[0]}")
+            print(f"  {files[1]}")
 
         print()
         print("First 20 prefixes:")
@@ -278,6 +347,10 @@ def main():
         for network in networks[:20]:
             print(f"  {network}")
 
+    if args.json:
+        print(json.dumps({"countries": report}, indent=2))
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

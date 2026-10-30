@@ -3,9 +3,10 @@
 whois-contacts.py - who do I contact about this IP / ASN?
 
 Usage:
-    whois-contacts.py <ip|prefix|ASN>
+    whois-contacts.py <ip|prefix|ASN> [--json]
     whois-contacts.py 193.0.0.1
     whois-contacts.py AS3333
+    whois-contacts.py AS3333 --json     # one JSON document on stdout, for scripts
 
 Prints the abuse contact, the registration record (network / AS name, org,
 country, status) and the admin / tech / abuse contacts with e-mail and phone.
@@ -13,8 +14,13 @@ For RIPE-managed resources the contact handles (admin-c, tech-c, abuse-c, org)
 are resolved through the RIPE Database; for other registries (ARIN, APNIC,
 LACNIC, AFRINIC) the contact fields from their whois record are shown as-is.
 
+With --json a single JSON document is printed instead (progress and warnings
+go to stderr, errors become {"error": ...} with exit code 1).
+
 Data source: RIPEstat abuse-contact-finder + whois, RIPE Database REST API.
 """
+import argparse
+import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -35,13 +41,16 @@ SKIP_KEYS = {"comment", "ref", "remarks", "source", "import", "export", "mp-impo
 
 
 def stat(endpoint, resource):
-    try:
-        r = requests.get(f"{RIPE_STAT}/{endpoint}/data.json",
-                         params={"resource": resource}, timeout=20)
-        r.raise_for_status()
-        return r.json().get("data") or {}
-    except (requests.RequestException, ValueError):
-        return None
+    """RIPEstat data dict, or None if it could not be fetched (one retry: the API occasionally times out)."""
+    for _attempt in range(2):
+        try:
+            r = requests.get(f"{RIPE_STAT}/{endpoint}/data.json",
+                             params={"resource": resource}, timeout=20)
+            r.raise_for_status()
+            return r.json().get("data") or {}
+        except (requests.RequestException, ValueError):
+            pass
+    return None
 
 
 def db_lookup(handle):
@@ -70,43 +79,36 @@ def flatten(records):
     return [(x["key"], x["value"]) for rec in records for x in rec]
 
 
-def print_contact(role, handle, attrs):
+def contact_entry(role, handle, attrs):
+    """One resolved contact as a plain dict (attrs is None when the handle could not be resolved)."""
     if attrs is None:
-        print(f"  {role:<8} {handle}  (could not be resolved)")
-        return
+        return {"role": role, "handle": handle, "name": None, "resolved": False,
+                "emails": [], "abuse": [], "phones": [], "address": None}
     name = (attrs.get("role") or attrs.get("person") or attrs.get("org-name") or [handle])[0]
-    print(f"  {role:<8} {handle} - {name}")
-    for key, label in (("e-mail", "e-mail"), ("abuse-mailbox", "abuse"), ("phone", "phone")):
-        for v in attrs.get(key, []):
-            print(f"{'':<11}{label}: {v}")
-    if attrs.get("_type") == "organisation":
-        addr = ", ".join(attrs.get("address", []))
-        if addr:
-            print(f"{'':<11}address: {addr}")
+    addr = ", ".join(attrs.get("address", [])) if attrs.get("_type") == "organisation" else ""
+    return {"role": role, "handle": handle, "name": name, "resolved": True,
+            "emails": attrs.get("e-mail", []), "abuse": attrs.get("abuse-mailbox", []),
+            "phones": attrs.get("phone", []), "address": addr or None}
 
 
-def show_ripe(pairs):
-    handles = []
+def ripe_details(pairs):
+    """(registration pairs, contacts) for a RIPE-managed resource; handles are resolved via the RIPE DB."""
+    registration, handles = [], []
     for key, value in pairs:
         if key in MAIN_KEYS and key not in HANDLE_KEYS:
-            print(f"  {key:<14}{value}")
+            registration.append((key, value))
         elif key in HANDLE_KEYS and (key, value) not in handles:
             handles.append((key, value))
 
-    if not handles:
-        return
-    print("\nContacts")
     with ThreadPoolExecutor(max_workers=6) as pool:
         results = list(pool.map(lambda kv: db_lookup(kv[1]), handles))
-    for (role, handle), attrs in zip(handles, results):
-        print_contact(role, handle, attrs)
+    contacts = [contact_entry(role, handle, attrs) for (role, handle), attrs in zip(handles, results)]
+    return registration, contacts
 
 
-def show_other(pairs):
-    for key, value in pairs:
-        if key.lower() in SKIP_KEYS or not value:
-            continue
-        print(f"  {key:<16}{value}")
+def other_details(pairs):
+    """Registration pairs for a non-RIPE record: shown as-is, minus free-text noise."""
+    return [(k, v) for k, v in pairs if k.lower() not in SKIP_KEYS and v], []
 
 
 def normalise(arg):
@@ -118,19 +120,12 @@ def normalise(arg):
     return arg
 
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: whois-contacts.py <ip|prefix|ASN>")
-        sys.exit(1)
-
-    resource = normalise(sys.argv[1])
-    print(f"\nContacts for {resource}\n")
-
+def gather(resource):
+    """Everything about who to contact for a resource. Raises LookupError if RIPEstat cannot be reached."""
     abuse = stat("abuse-contact-finder", resource)
     whois = stat("whois", resource)
     if abuse is None and whois is None:
-        print("Error: RIPEstat is unreachable or rejected the resource.")
-        sys.exit(1)
+        raise LookupError("RIPEstat is unreachable or rejected the resource.")
 
     emails = (abuse or {}).get("abuse_contacts") or []
     if not emails and whois and "/" not in resource and not resource.startswith("AS"):
@@ -140,23 +135,67 @@ def main():
                 emails = (stat("abuse-contact-finder", value.split(",")[0].strip()) or {}).get(
                     "abuse_contacts") or []
                 break
-    print("Abuse contact : " + (", ".join(emails) if emails else "none registered"))
     authority = ((whois or {}).get("authorities") or ["unknown"])[0]
-    print(f"Registry      : {authority.upper()}\n")
 
+    data = {"resource": resource, "abuse_contacts": emails, "registry": authority.upper(),
+            "found": False, "registration": [], "contacts": []}
     records = (whois or {}).get("records") or []
-    if not records:
+    if records:
+        pairs = flatten(records)
+        registration, contacts = ripe_details(pairs) if authority == "ripe" else other_details(pairs)
+        data.update(found=True, registration=[{"key": k, "value": v} for k, v in registration], contacts=contacts)
+    return data
+
+
+def render(d):
+    """Print the dict returned by gather() as the familiar text report."""
+    print(f"\nContacts for {d['resource']}\n")
+    print("Abuse contact : " + (", ".join(d["abuse_contacts"]) if d["abuse_contacts"] else "none registered"))
+    print(f"Registry      : {d['registry']}\n")
+
+    if not d["found"]:
         print("No whois record found.")
         return
 
     print("Registration")
-    pairs = flatten(records)
-    if authority == "ripe":
-        show_ripe(pairs)
-    else:
-        show_other(pairs)
+    ripe = d["registry"] == "RIPE"
+    for item in d["registration"]:
+        print(f"  {item['key']:<{14 if ripe else 16}}{item['value']}")
+
+    if d["contacts"]:
+        print("\nContacts")
+        for c in d["contacts"]:
+            if not c["resolved"]:
+                print(f"  {c['role']:<8} {c['handle']}  (could not be resolved)")
+                continue
+            print(f"  {c['role']:<8} {c['handle']} - {c['name']}")
+            for label, values in (("e-mail", c["emails"]), ("abuse", c["abuse"]), ("phone", c["phones"])):
+                for v in values:
+                    print(f"{'':<11}{label}: {v}")
+            if c["address"]:
+                print(f"{'':<11}address: {c['address']}")
     print()
 
 
+def main():
+    ap = argparse.ArgumentParser(description="Who to contact about an IP, prefix or ASN (RIPEstat + RIPE Database).")
+    ap.add_argument("resource", help="IP address, prefix or AS number (e.g. 193.0.0.1, 193.0.0.0/21, AS3333)")
+    ap.add_argument("--json", action="store_true", help="print one JSON document instead of the text report")
+    args = ap.parse_args()
+
+    resource = normalise(args.resource)
+    try:
+        data = gather(resource)
+    except LookupError as e:
+        print(json.dumps({"error": str(e)}) if args.json else f"\nContacts for {resource}\n\nError: {e}")
+        return 1
+
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    else:
+        render(data)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -157,59 +157,47 @@ def lookup(ip):
     return data
 
 
-def header(title, lead=True):
-    print(("\n" if lead else "") + "=" * 60)
-    print(title)
-    print("=" * 60)
-
-
 def render(d, show_prefixes=False):
-    """Print the dict returned by lookup() as the familiar text report."""
-    header("IP INFORMATION", lead=False)
-    print(f"IP Address : {d['ip']}")
+    """Print the dict returned by lookup() as a short key/value report."""
+    rows = [("IP", d["ip"])]
 
-    if not d["announced"]:
-        print("BGP Prefix : Not announced")
-        print("ASN        : None (this IP is not announced in BGP)")
+    if d["announced"]:
+        rows += [
+            ("Prefix", d["bgp_prefix"] or "Unknown"),
+            ("ASN", d["asn"]),
+            ("Holder", d["holder"] or "Unknown"),
+        ]
+    else:
         reg = d["registry"]
-        header("REGISTRY INFORMATION (whois)")
+        rows.append(("Prefix", "not announced in BGP"))
         if reg["block"]:
-            print(f"Block      : {reg['block']}")
-            print(f"Net name   : {reg['net_name'] or 'Unknown'}")
-            print(f"Country    : {reg['country'] or 'Unknown'}")
-            print(f"Org        : {reg['org'] or 'Unknown'}")
-            print(f"Status     : {reg['status'] or 'Unknown'}")
+            rows += [
+                ("Block", reg["block"]),
+                ("Net name", reg["net_name"] or "Unknown"),
+                ("Country", reg["country"] or "Unknown"),
+                ("Org", reg["org"] or "Unknown"),
+                ("Status", reg["status"] or "Unknown"),
+            ]
         else:
-            print("No whois record found in the RIPE database.")
+            rows.append(("Registry", "no whois record found"))
         if reg["rir_geo"]:
-            print(f"RIR geo    : {reg['rir_geo']['location'] or 'Unknown'} ({reg['rir_geo']['resource']})")
-        header("DNS INFORMATION")
-        print(f"Hostname   : {d['reverse_dns'] or 'No reverse DNS record'}")
+            rows.append(("RIR geo", f"{reg['rir_geo']['location'] or 'Unknown'} ({reg['rir_geo']['resource']})"))
+
+    rows.append(("rDNS", d["reverse_dns"] or "none"))
+
+    width = max(len(k) for k, _ in rows)
+    for k, v in rows:
+        print(f"{k:<{width}} : {v}")
+
+    if not (show_prefixes and d["announced"]):
         return
-
-    print(f"BGP Prefix : {d['bgp_prefix'] or 'Unknown'}")
-    print(f"ASN        : {d['asn']}")
-
-    header("ASN INFORMATION")
-    print(f"ASN        : {d['asn']}")
-    print(f"Holder     : {d['holder'] or 'Unknown'}")
-    announcing = d["announcing"]
-    print(f"Announcing : {'Unknown' if announcing is None else 'Yes' if announcing else 'No'}")
-
-    header("DNS INFORMATION")
-    print(f"Hostname   : {d['reverse_dns'] or 'No reverse DNS record'}")
-
-    if not show_prefixes:
-        return
-
-    v4 = d["prefixes"]["ipv4"]
-    header(f"ANNOUNCED IPv4 PREFIXES ({len(v4)})")
 
     # Highlight in red the prefix(es) that contain the queried IP (only when
     # printing to a terminal, so piped output stays free of escape codes).
+    v4 = d["prefixes"]["ipv4"]
+    print(f"\nIPv4 prefixes ({len(v4)}):")
     ip_obj = ipaddress.ip_address(d["ip"])
     use_color = sys.stdout.isatty()
-
     for p in v4:
         if use_color and ip_obj in ipaddress.ip_network(p, strict=False):
             print(f"\033[31m{p}  <-- {d['ip']}\033[0m")
@@ -266,7 +254,7 @@ def main():
         return fail("Invalid IP address.")
 
     if not args.json:
-        print("\nQuerying RIPEstat...\n")
+        print("Querying RIPEstat...", file=sys.stderr)
 
     try:
         data = lookup(ip)
@@ -283,9 +271,7 @@ def main():
     else:
         render(data, show_prefixes=args.prefixes)
         if filename:
-            print("\n" + "=" * 60)
-            print(f"Results saved to: {filename}")
-            print("=" * 60)
+            print(f"\nSaved to {filename}")
     return 0
 
 

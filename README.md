@@ -8,7 +8,7 @@ Most scripts query public data sources ([RIPEstat](https://stat.ripe.net), the R
 
 | Script | What it does |
 |---|---|
-| `iplookup.py` | Who is behind an IP (v4/v6)? Shows the announcing prefix and origin ASN, ASN holder, reverse DNS and all prefixes of that ASN. Falls back to the registry record if the IP is not in BGP. |
+| `iplookup.py` | Who is behind an IP (v4/v6)? Shows the announcing prefix and origin ASN, ASN holder, reverse DNS, and (with `--prefixes`) all prefixes of that ASN; `--json` for scripts. Falls back to the registry record if the IP is not in BGP. |
 | `asn2prefix.py` | Given an AS number, prints owner info, a routing summary (prefix and address counts, neighbours) and every announced prefix. |
 | `bgp-lg.py` | Looking glass: shows the BGP AS path towards an IP, draws it as a text topology and saves it as a PDF. |
 | `prefix-history.py` | Routing history of a prefix or ASN: first/last seen, announced now or not, and the announcement periods. |
@@ -35,6 +35,8 @@ pip install -r requirements.txt
 ```sh
 # who is behind this IP?
 ./iplookup.py                     # prompts for the IP
+./iplookup.py 8.8.8.8 --prefixes  # also list every IPv4 prefix of the ASN
+./iplookup.py 8.8.8.8 --json      # machine-readable output
 
 # everything about an AS
 ./asn2prefix.py                   # prompts for the AS number (e.g. AS15169)

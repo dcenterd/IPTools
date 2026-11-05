@@ -15,12 +15,18 @@ Usage: pcap_analyzer.py capture.pcap [--top N] [--json] [-o report.txt]
 """
 import argparse
 import gzip
+import html
 import ipaddress
 import json
 import math
+import os
+import random
+import re
+import shutil
 import socket
 import struct
 import sys
+import textwrap
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
@@ -835,11 +841,94 @@ class Analyzer:
 
 # ------------------------------------------------------------------ report model
 
+SEVERITY = {"high": ("HIGH", "bgred", 0), "medium": ("MEDIUM", "bgyellow", 1), "info": ("INFO", "bgblue", 2)}
+
+
+class Style:
+    """ANSI styling; every call is a no-op when colors are off."""
+    CODES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "blue": "34",
+             "magenta": "35", "cyan": "36", "bgred": "41;1;97", "bgyellow": "43;1;30", "bgblue": "44;1;97"}
+
+    def __init__(self, on):
+        self.on = on
+
+    def __call__(self, names, text):
+        if not self.on or not text:
+            return text
+        codes = ";".join(self.CODES[n] for n in names.split("+"))
+        return "\033[%sm%s\033[0m" % (codes, text)
+
+
+def block_bar(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    cells = frac * width
+    full = int(cells)
+    s = "█" * full
+    if full < width:
+        s += " ▏▎▍▌▋▊▉"[int((cells - full) * 8)]
+    if frac > 0 and not s.strip():
+        s = "▏"
+    return s.ljust(width)
+
+
+def tall_chart(values, height=4):
+    """Block-character area chart; returns `height` rows, top first."""
+    mx = max(values) or 1
+    levels = [v / mx * height * 8 for v in values]
+    rows = []
+    for r in range(height - 1, -1, -1):
+        line = ""
+        for lv in levels:
+            x = lv - r * 8
+            line += " " if x <= 0 else "█" if x >= 8 else SPARKS[max(0, int(math.ceil(x)) - 1)]
+        rows.append(line)
+    return rows
+
+
+def bin_series(per_second, n):
+    """Rebin {epoch_second: bytes} into n bins -> (bins, start, end, seconds_per_bin)."""
+    lo, hi = min(per_second), max(per_second)
+    span = hi - lo + 1
+    bins = [0] * n
+    for sec, b in per_second.items():
+        bins[min(n - 1, int((sec - lo) * n / span))] += b
+    return bins, lo, hi + 1, span / n
+
+
+_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def sort_key(cell):
+    """Numeric value of a table cell ('1,234', '12.5%', '1.4 MB') or None."""
+    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*(%|[KMGT]?B)?", cell.replace(",", "").strip())
+    if not m:
+        return None
+    return float(m.group(1)) * _UNITS.get(m.group(2), 1)
+
+
+def bar_col(headers):
+    return next((i for i, h in enumerate(headers) if h.startswith("%")), None)
+
+
+def pct_value(cell):
+    c = cell.strip()
+    try:
+        return float(c[:-1]) / 100.0 if c.endswith("%") else None
+    except ValueError:
+        return None
+
+
+def _numlike(s):
+    s = s.replace(",", "").replace("%", "").replace(".", "", 1).strip()
+    return s.isdigit() or s in ("-", "")
+
+
 class Report:
-    """Collects sections once; rendered as text or JSON."""
+    """Sections of typed items, built once and rendered as text, JSON or HTML."""
 
     def __init__(self):
         self.sections = []
+        self.meta = {}
 
     def section(self, title):
         s = {"title": title, "items": []}
@@ -848,70 +937,485 @@ class Report:
 
     @staticmethod
     def kv(sec, key, value):
-        sec["items"].append(("kv", key, value))
+        sec["items"].append({"t": "kv", "k": key, "v": str(value)})
 
     @staticmethod
-    def note(sec, text):
-        sec["items"].append(("note", text))
+    def note(sec, text, text_only=False):
+        sec["items"].append({"t": "note", "text": text, "text_only": text_only})
 
     @staticmethod
     def table(sec, title, headers, rows):
         if rows:
-            sec["items"].append(("table", title, headers, rows))
+            sec["items"].append({"t": "table", "title": title, "headers": headers,
+                                 "rows": [[str(c) for c in r] for r in rows]})
 
-    def to_text(self, width=100):
+    @staticmethod
+    def kpis(sec, items):
+        sec["items"].append({"t": "kpis", "items": items})
+
+    @staticmethod
+    def findings(sec, items):
+        sec["items"].append({"t": "findings", "items": sorted(items, key=lambda x: SEVERITY[x[0]][2])})
+
+    @staticmethod
+    def timeline(sec, per_second):
+        if per_second:
+            sec["items"].append({"t": "timeline", "per_second": per_second})
+
+    @staticmethod
+    def donut(sec, title, pairs):
+        if pairs:
+            sec["items"].append({"t": "donut", "title": title, "pairs": pairs})
+
+    @staticmethod
+    def graph(sec, nodes, edges, hubs):
+        if len(nodes) >= 2:
+            sec["items"].append({"t": "graph", "nodes": nodes, "edges": edges, "hubs": hubs})
+
+    # ------------------------------------------------------------ text
+    def to_text(self, st, width=100):
         out = []
         for s in self.sections:
-            out.append("")
-            out.append("=" * 8 + " " + s["title"] + " " + "=" * max(3, width - len(s["title"]) - 10))
-            kvs = [i for i in s["items"] if i[0] == "kv"]
-            kw = max((len(i[1]) for i in kvs), default=0)
+            title = s["title"]
+            out += ["", st("bold+cyan", "━━ ") + st("bold", title) + " " + st("cyan", "━" * max(3, width - len(title) - 5))]
+            kw = max((len(i["k"]) for i in s["items"] if i["t"] == "kv"), default=0)
+            prev = None
             for it in s["items"]:
-                if it[0] == "kv":
-                    out.append("  %-*s  %s" % (kw, it[1], it[2]))
-                elif it[0] == "note":
-                    out.append("  " + it[1])
-                else:
-                    _, title, headers, rows = it
+                t = it["t"]
+                if t == "kv" and prev in ("note", "findings", "kpis"):
                     out.append("")
-                    out.append("  " + title)
-                    cols = list(zip(*([headers] + [[str(c) for c in r] for r in rows])))
-                    widths = [min(max(len(str(c)) for c in col), 58) for col in cols]
-                    right = [all(_numlike(str(r[i])) for r in rows) for i in range(len(headers))]
-
-                    def line(cells):
-                        parts = []
-                        for i, c in enumerate(cells):
-                            c = str(c)
-                            if len(c) > widths[i]:
-                                c = c[:widths[i] - 1] + "…"
-                            parts.append(c.rjust(widths[i]) if right[i] else c.ljust(widths[i]))
-                        return "    " + "  ".join(parts).rstrip()
-                    out.append(line(headers))
-                    out.append("    " + "  ".join("-" * w for w in widths))
-                    for r in rows:
-                        out.append(line(r))
+                prev = t
+                if t == "kv":
+                    out.append("  %s  %s" % (st("dim", it["k"].ljust(kw)), it["v"]))
+                elif t == "note":
+                    out.append("  " + st("dim", it["text"]))
+                elif t == "table":
+                    out += self._table_text(st, it, width)
+                elif t == "kpis":
+                    out += self._kpis_text(st, it["items"], width)
+                elif t == "findings":
+                    out += self._findings_text(st, it["items"], width)
+                elif t == "timeline":
+                    out += self._timeline_text(st, it["per_second"], width)
+                elif t == "graph":
+                    out += self._graph_text(st, it, width)
         return "\n".join(out).lstrip("\n") + "\n"
 
+    @staticmethod
+    def _table_text(st, it, width):
+        headers, rows = it["headers"], it["rows"]
+        bi = bar_col(headers)
+        cols = list(zip(*([headers] + rows)))
+        widths = [min(max(len(c) for c in col), 58) for col in cols]
+        budget = width - 6 - (14 if bi is not None else 0) - 2 * (len(widths) - 1)
+        while sum(widths) > budget and max(widths) > 16:
+            widths[widths.index(max(widths))] -= 1
+        right = [all(_numlike(r[i]) for r in rows) for i in range(len(headers))]
+
+        def cell(i, c):
+            if len(c) > widths[i]:
+                c = c[:widths[i] - 1] + "…"
+            return c.rjust(widths[i]) if right[i] else c.ljust(widths[i])
+        out = ["", "  " + st("bold", it["title"])]
+        out.append("    " + "  ".join(st("dim", cell(i, h)) for i, h in enumerate(headers)) + (" " * 14 if bi is not None else ""))
+        out.append("    " + st("dim", "  ".join("─" * w for w in widths)) + (st("dim", "  " + "─" * 12) if bi is not None else ""))
+        for r in rows:
+            line = "    " + "  ".join(cell(i, c) for i, c in enumerate(r))
+            if bi is not None:
+                f = pct_value(r[bi])
+                line += "  " + st("cyan", block_bar(f if f is not None else 0, 12))
+            out.append(line.rstrip() if bi is None else line)
+        return out
+
+    @staticmethod
+    def _kpis_text(st, items, width):
+        cw = max(14, max(max(len(i[0]), len(i[1]), len(i[2])) for i in items) + 2)
+        per = max(1, (width - 2) // (cw + 2))
+        out = [""]
+        for start in range(0, len(items), per):
+            chunk = items[start:start + per]
+            out.append("  " + " ".join("┌" + "─" * cw + "┐" for _ in chunk))
+            out.append("  " + " ".join("│" + st("dim", (" " + c[0]).ljust(cw)) + "│" for c in chunk))
+            out.append("  " + " ".join("│" + st("bold+cyan", (" " + c[1]).ljust(cw)) + "│" for c in chunk))
+            out.append("  " + " ".join("│" + st("dim", (" " + c[2]).ljust(cw)) + "│" for c in chunk))
+            out.append("  " + " ".join("└" + "─" * cw + "┘" for _ in chunk))
+        return out
+
+    @staticmethod
+    def _findings_text(st, items, width):
+        out = [""]
+        if not items:
+            return out + ["  " + st("green", "✔ ") + "Nothing notable found by the built-in checks."]
+        for sev, text in items:
+            label, style, _ = SEVERITY[sev]
+            lines = textwrap.wrap(text, max(30, width - 14)) or [""]
+            out.append("  " + st(style, " %-6s " % label) + " " + lines[0])
+            out += ["  " + " " * 9 + " " + l for l in lines[1:]]
+        return out
+
+    @staticmethod
+    def _timeline_text(st, per_second, width):
+        n = max(20, min(80, width - 20))
+        bins, lo, hi, bs = bin_series(per_second, n)
+        rows = tall_chart(bins, 4)
+        peak = human_bps(max(bins) * 8 / bs)
+        out = ["", "  " + st("bold", "Traffic over time") + st("dim", "  (bandwidth per %.2f s)" % bs)]
+        for i, r in enumerate(rows):
+            lab = peak if i == 0 else "0" if i == len(rows) - 1 else ""
+            out.append("    " + st("dim", lab.rjust(10)) + st("dim", " ┤") + st("cyan", r))
+        out.append("    " + " " * 10 + st("dim", " └" + "─" * n))
+        a, b = fmt_ts(lo)[11:19], fmt_ts(hi)[11:19]
+        out.append("    " + " " * 12 + st("dim", a + " " * max(1, n - len(a) - len(b)) + b + " UTC"))
+        return out
+
+    @staticmethod
+    def _graph_text(st, it, width):
+        out = ["", "  " + st("bold", "Talker map") + st("dim", "  (busiest hosts and their biggest peers)")]
+        bw = 14
+        for hub in it["hubs"]:
+            out.append("")
+            out.append("  " + st("bold+magenta", hub["label"]) + st("dim", "  %s, %s" % (hub["cls"], human_bytes(hub["bytes"]))))
+            mx = max((p[1] for p in hub["peers"]), default=1) or 1
+            for i, (label, b, pk) in enumerate(hub["peers"]):
+                branch = "└─" if i == len(hub["peers"]) - 1 else "├─"
+                lab = label if len(label) <= 44 else label[:43] + "…"
+                out.append("   %s %s %s %s %s" % (st("dim", branch), lab.ljust(44), st("cyan", block_bar(b / mx, bw)),
+                                                  human_bytes(b).rjust(9), st("dim", "{:,} pkts".format(pk))))
+        return out
+
+    # ------------------------------------------------------------ json
     def to_json(self):
         data = {}
         for s in self.sections:
             sec = {"values": {}, "notes": [], "tables": {}}
             for it in s["items"]:
-                if it[0] == "kv":
-                    sec["values"][it[1]] = it[2]
-                elif it[0] == "note":
-                    sec["notes"].append(it[1])
-                else:
-                    _, title, headers, rows = it
-                    sec["tables"][title] = [dict(zip(headers, r)) for r in rows]
+                t = it["t"]
+                if t == "kv":
+                    sec["values"][it["k"]] = it["v"]
+                elif t == "note":
+                    sec["notes"].append(it["text"])
+                elif t == "table":
+                    sec["tables"][it["title"]] = [dict(zip(it["headers"], r)) for r in it["rows"]]
+                elif t == "kpis":
+                    sec["kpis"] = {k: v for k, v, _ in it["items"]}
+                elif t == "findings":
+                    sec["findings"] = [{"severity": a, "text": b} for a, b in it["items"]]
+                elif t == "timeline":
+                    bins, lo, hi, bs = bin_series(it["per_second"], 60)
+                    sec["timeline"] = {"start": lo, "end": hi, "seconds_per_bin": bs, "bytes": bins}
+                elif t == "graph":
+                    sec["graph"] = {"nodes": it["nodes"], "edges": [
+                        {"a": a, "b": b, "bytes": by, "packets": pk} for a, b, by, pk in it["edges"]]}
             data[s["title"]] = sec
         return data
 
+    # ------------------------------------------------------------ html
+    def to_html(self):
+        return render_html(self)
 
-def _numlike(s):
-    s = s.replace(",", "").replace("%", "").replace(".", "", 1).strip()
-    return s.isdigit() or s in ("-", "")
+
+# ------------------------------------------------------------------ html renderer
+
+HTML_CSS = """
+:root{--bg:#f4f6f9;--card:#fff;--ink:#141a22;--mute:#5a6675;--line:#e2e7ee;--bar:#93c5fd;--head:#0f172a;
+--c1:#2563eb;--c2:#ea580c;--c3:#16a34a;--c4:#9333ea;--c5:#0891b2;--c6:#db2777;--c7:#ca8a04;--c8:#64748b;
+--high:#dc2626;--med:#d97706;--info:#2563eb;--ok:#16a34a}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0d1117;--card:#161b22;--ink:#e6edf3;
+--mute:#9aa7b4;--line:#2a313c;--bar:#1f6feb;--head:#010409;--c1:#58a6ff;--c2:#ff9b4a;--c3:#56d364;--c4:#c297ff;
+--c5:#39c5cf;--c6:#ff7eb6;--c7:#e3b341;--c8:#8b949e;--high:#ff6b6b;--med:#f0a53a;--info:#58a6ff;--ok:#56d364}}
+:root[data-theme="dark"]{--bg:#0d1117;--card:#161b22;--ink:#e6edf3;--mute:#9aa7b4;--line:#2a313c;--bar:#1f6feb;
+--head:#010409;--c1:#58a6ff;--c2:#ff9b4a;--c3:#56d364;--c4:#c297ff;--c5:#39c5cf;--c6:#ff7eb6;--c7:#e3b341;
+--c8:#8b949e;--high:#ff6b6b;--med:#f0a53a;--info:#58a6ff;--ok:#56d364}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:0 16px}
+header.top{background:var(--head);color:#fff;padding:22px 0}
+header.top h1{margin:0 0 4px;font-size:22px;font-weight:650;letter-spacing:.2px}
+header.top .sub{color:#aab6c5;font-size:13px;word-break:break-all}
+.theme{float:right;background:transparent;color:#fff;border:1px solid #475569;border-radius:6px;padding:4px 10px;cursor:pointer}
+nav{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;gap:4px;overflow-x:auto;padding-top:6px;padding-bottom:6px}
+nav a{color:var(--mute);text-decoration:none;white-space:nowrap;padding:4px 10px;border-radius:6px;font-size:13px}
+nav a:hover{background:var(--bg);color:var(--ink)}
+main{padding:20px 0 48px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi .l{font-size:12px;color:var(--mute);text-transform:uppercase;letter-spacing:.5px}
+.kpi .v{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums;margin:2px 0}
+.kpi .s{font-size:12px;color:var(--mute)}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:18px}
+section h2{margin:0 0 12px;font-size:16px;letter-spacing:.3px}
+h3{margin:0 0 8px;font-size:13px;color:var(--mute);font-weight:600}
+dl.kv{display:grid;grid-template-columns:minmax(180px,max-content) 1fr;gap:4px 18px;margin:0 0 12px}
+dl.kv dt{color:var(--mute)}dl.kv dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
+p.note{color:var(--mute);margin:6px 0;font-size:13px}
+.tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,430px),1fr));gap:14px;margin-top:6px}
+.tcard{border:1px solid var(--line);border-radius:10px;padding:10px 12px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:4px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+tr:last-child td{border-bottom:0}
+th{color:var(--mute);font-weight:600;cursor:pointer;user-select:none}
+th:hover{color:var(--ink)}th.asc::after{content:" \\25B2"}th.desc::after{content:" \\25BC"}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.txt{max-width:340px;overflow:hidden;text-overflow:ellipsis}
+.bar{position:relative;min-width:96px;height:18px;line-height:18px}
+.bar i{position:absolute;left:0;top:2px;bottom:2px;background:var(--bar);opacity:.6;border-radius:3px}
+.bar span{position:relative;display:block;text-align:right;padding-right:4px}
+.findings{display:flex;flex-direction:column;gap:8px}
+.finding{display:flex;gap:10px;align-items:flex-start}
+.badge{flex:none;min-width:70px;text-align:center;font-size:11px;font-weight:700;letter-spacing:.6px;color:#fff;border-radius:5px;padding:2px 8px}
+.badge.high{background:var(--high)}.badge.medium{background:var(--med)}.badge.info{background:var(--info)}
+.ok{color:var(--ok);font-weight:600}
+.chart{width:100%;height:auto;display:block}
+.chart text{fill:var(--mute);font-size:11px}
+.chart .lbl{fill:var(--ink);stroke:var(--card);stroke-width:3px;paint-order:stroke}
+section>h3{margin-top:14px}
+.donuts{display:flex;flex-wrap:wrap;gap:24px;margin-bottom:10px}
+.donut{display:flex;gap:16px;align-items:center}
+.donut svg{width:150px;height:150px;flex:none}
+.donut .c{font-size:15px;font-weight:650;fill:var(--ink);text-anchor:middle}
+.donut .c2{font-size:10px;fill:var(--mute);text-anchor:middle}
+.legend{list-style:none;margin:0;padding:0;font-size:12px}
+.legend li{display:flex;gap:6px;align-items:center;white-space:nowrap}
+.legend b{width:10px;height:10px;border-radius:2px;display:inline-block}
+.legend em{font-style:normal;color:var(--mute);margin-left:6px}
+.graphlegend{display:flex;gap:16px;font-size:12px;color:var(--mute);margin:4px 0 0}
+.graphlegend b{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px}
+@media print{nav,.theme{display:none}body{background:#fff}section{break-inside:avoid}}
+"""
+
+HTML_JS = """
+(function(){var r=document.documentElement,b=document.querySelector('.theme');
+if(b)b.onclick=function(){var d=r.getAttribute('data-theme')==='dark'||(!r.getAttribute('data-theme')&&matchMedia('(prefers-color-scheme: dark)').matches);r.setAttribute('data-theme',d?'light':'dark')};
+document.querySelectorAll('table.sortable th').forEach(function(th,i){th.onclick=function(){
+var t=th.closest('table'),tb=t.tBodies[0],dir=th.classList.contains('asc')?-1:1;
+t.querySelectorAll('th').forEach(function(x){x.classList.remove('asc','desc')});th.classList.add(dir===1?'asc':'desc');
+var rows=[].slice.call(tb.rows);rows.sort(function(a,c){var x=a.cells[i],y=c.cells[i],p=x.dataset.v,q=y.dataset.v;
+if(p!==undefined&&q!==undefined)return(parseFloat(p)-parseFloat(q))*dir;return x.textContent.localeCompare(y.textContent)*dir});
+rows.forEach(function(x){tb.appendChild(x)})}})})();
+"""
+
+
+def _slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def _nav_label(title):
+    m = re.match(r"LAYER (\S+) - ([^(]+)", title)
+    if m:
+        return "L%s %s" % (m.group(1), m.group(2).strip().title())
+    return title.title()
+
+
+def _e(x):
+    return html.escape(str(x), quote=True)
+
+
+def _html_table(it):
+    headers, rows = it["headers"], it["rows"]
+    bi = bar_col(headers)
+    num = [all(_numlike(r[i]) for r in rows) for i in range(len(headers))]
+    out = ['<div class="tcard"><h3>%s</h3><table class="sortable"><thead><tr>' % _e(it["title"])]
+    for i, h in enumerate(headers):
+        out.append('<th class="%s">%s</th>' % ("num" if num[i] else "", _e(h)))
+    out.append("</tr></thead><tbody>")
+    for r in rows:
+        out.append("<tr>")
+        for i, c in enumerate(r):
+            key = sort_key(c)
+            dv = ' data-v="%s"' % key if key is not None else ""
+            if i == bi and pct_value(c) is not None:
+                out.append('<td class="num"%s><div class="bar"><i style="width:%.1f%%"></i><span>%s</span></div></td>'
+                           % (dv, min(100.0, pct_value(c) * 100), _e(c)))
+            else:
+                out.append('<td class="%s"%s title="%s">%s</td>' % ("num" if num[i] else "txt", dv, _e(c), _e(c)))
+        out.append("</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _svg_timeline(per_second):
+    n = 120
+    bins, lo, hi, bs = bin_series(per_second, n)
+    rates = [b * 8 / bs for b in bins]
+    mx = max(rates) or 1
+    W, H, L, B, T, Rr = 900, 210, 70, 28, 10, 10
+    pw, ph = W - L - Rr, H - T - B
+    bw = pw / n
+    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Traffic over time">' % (W, H)]
+    for k in range(5):
+        y = T + ph - ph * k / 4
+        out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--line)"/>' % (L, W - Rr, y, y))
+        out.append('<text x="%d" y="%.1f" text-anchor="end">%s</text>' % (L - 6, y + 4, _e(human_bps(mx * k / 4) if k else "0")))
+    for i, r in enumerate(rates):
+        if r <= 0:
+            continue
+        h = max(1.0, ph * r / mx)
+        t0 = fmt_ts(lo + i * bs)[11:19]
+        out.append('<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" fill="var(--c1)" rx="1"><title>%s UTC - %s</title></rect>'
+                   % (L + i * bw, T + ph - h, max(1.0, bw - 1), h, _e(t0), _e(human_bps(r))))
+    for frac, anchor in ((0, "start"), (0.5, "middle"), (1, "end")):
+        x = L + pw * frac
+        out.append('<text x="%.1f" y="%d" text-anchor="%s">%s</text>' % (x, H - 8, anchor, _e(fmt_ts(lo + (hi - lo) * frac)[11:19] + " UTC")))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _svg_donut(title, pairs):
+    total = sum(v for _, v in pairs) or 1
+    top7 = pairs[:7]
+    rest = sum(v for _, v in pairs[7:])
+    if rest:
+        top7 = top7 + [("other", rest)]
+    r, sw = 56, 24
+    circ = 2 * math.pi * r
+    segs, legend, cum = [], [], 0.0
+    for i, (lab, v) in enumerate(top7):
+        ln = circ * v / total
+        col = "var(--c%d)" % (i % 8 + 1)
+        segs.append('<circle r="%d" cx="75" cy="75" fill="none" stroke="%s" stroke-width="%d" stroke-dasharray="%.2f %.2f" '
+                    'stroke-dashoffset="%.2f" transform="rotate(-90 75 75)"><title>%s: %s (%.1f%%)</title></circle>'
+                    % (r, col, sw, max(0.0, ln - 1.0), circ - max(0.0, ln - 1.0), -cum, _e(lab), "{:,}".format(v), 100.0 * v / total))
+        legend.append('<li><b style="background:%s"></b>%s<em>%.1f%%</em></li>' % (col, _e(lab), 100.0 * v / total))
+        cum += ln
+    return ('<div class="donut"><svg viewBox="0 0 150 150" role="img" aria-label="%s">%s<text class="c" x="75" y="76">%s</text>'
+            '<text class="c2" x="75" y="90">packets</text></svg><div><h3>%s</h3><ul class="legend">%s</ul></div></div>'
+            % (_e(title), "".join(segs), _e("{:,}".format(total)), _e(title), "".join(legend)))
+
+
+def _graph_layout(nodes, edges, W, H):
+    n = len(nodes)
+    rnd = random.Random(7)
+    idx = {nd["ip"]: i for i, nd in enumerate(nodes)}
+    pos = [[W / 2 + (rnd.random() - 0.5) * W * 0.6, H / 2 + (rnd.random() - 0.5) * H * 0.6] for _ in nodes]
+    k = math.sqrt(W * H / max(n, 1)) * 0.75
+    temp = W / 6
+    mxb = max((e[2] for e in edges), default=1) or 1
+    for _ in range(250):
+        disp = [[0.0, 0.0] for _ in nodes]
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx, dy = pos[i][0] - pos[j][0], pos[i][1] - pos[j][1]
+                d = max(0.5, math.hypot(dx, dy))
+                f = k * k / d
+                disp[i][0] += dx / d * f
+                disp[i][1] += dy / d * f
+                disp[j][0] -= dx / d * f
+                disp[j][1] -= dy / d * f
+        for a, b, by, _pk in edges:
+            i, j = idx[a], idx[b]
+            dx, dy = pos[i][0] - pos[j][0], pos[i][1] - pos[j][1]
+            d = max(0.5, math.hypot(dx, dy))
+            f = d * d / k * (0.4 + 0.6 * by / mxb)
+            disp[i][0] -= dx / d * f
+            disp[i][1] -= dy / d * f
+            disp[j][0] += dx / d * f
+            disp[j][1] += dy / d * f
+        for i in range(n):
+            dx, dy = disp[i][0] + (W / 2 - pos[i][0]) * 0.02, disp[i][1] + (H / 2 - pos[i][1]) * 0.02
+            d = max(0.01, math.hypot(dx, dy))
+            pos[i][0] = min(W - 60, max(60, pos[i][0] + dx / d * min(d, temp)))
+            pos[i][1] = min(H - 30, max(30, pos[i][1] + dy / d * min(d, temp)))
+        temp *= 0.975
+    return pos
+
+
+def _svg_graph(it):
+    nodes, edges = it["nodes"], it["edges"]
+    W, H = 900, 520
+    pos = _graph_layout(nodes, edges, W, H)
+    idx = {nd["ip"]: i for i, nd in enumerate(nodes)}
+    mxn = max(nd["bytes"] for nd in nodes) or 1
+    mxe = max((e[2] for e in edges), default=1) or 1
+    color = {"private": "var(--c1)", "public": "var(--c2)"}
+    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Conversation map">' % (W, H)]
+    for a, b, by, pk in edges:
+        i, j = idx[a], idx[b]
+        out.append('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" stroke="var(--c8)" stroke-opacity=".45" stroke-width="%.2f">'
+                   '<title>%s - %s: %s, %s packets</title></line>'
+                   % (pos[i][0], pos[i][1], pos[j][0], pos[j][1], 1 + 7 * math.sqrt(by / mxe),
+                      _e(a), _e(b), _e(human_bytes(by)), "{:,}".format(pk)))
+    for nd, (x, y) in zip(nodes, pos):
+        rad = 6 + 20 * math.sqrt(nd["bytes"] / mxn)
+        col = color.get(nd["cls"], "var(--c8)")
+        out.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" fill-opacity=".85" stroke="var(--card)" stroke-width="2">'
+                   '<title>%s (%s) - %s, %s packets</title></circle>'
+                   % (x, y, rad, col, _e(nd["label"]), _e(nd["cls"]), _e(human_bytes(nd["bytes"])), "{:,}".format(nd["pkts"])))
+        lab = nd["label"] if len(nd["label"]) <= 28 else nd["label"][:27] + "…"
+        out.append('<text class="lbl" x="%.1f" y="%.1f" text-anchor="middle">%s</text>' % (x, y + rad + 12, _e(lab)))
+    out.append("</svg>")
+    out.append('<div class="graphlegend"><span><b style="background:var(--c1)"></b>private</span>'
+               '<span><b style="background:var(--c2)"></b>public</span><span><b style="background:var(--c8)"></b>other</span>'
+               '<span>node size = traffic, link width = bytes exchanged</span></div>')
+    return "".join(out)
+
+
+def render_html(rep):
+    meta = rep.meta
+    parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">'
+             '<meta name="viewport" content="width=device-width,initial-scale=1">'
+             '<title>PCAP report - %s</title><style>%s</style></head><body>' % (_e(os.path.basename(meta.get("path", ""))), HTML_CSS)]
+    parts.append('<header class="top"><div class="wrap"><button class="theme" type="button">Theme</button>'
+                 '<h1>Packet capture report</h1><div class="sub">%s &middot; %s &middot; generated %s</div></div></header>'
+                 % (_e(meta.get("path", "")), _e(meta.get("format", "")), _e(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))))
+    nav = [("findings", "Findings")] + [(_slug(s["title"]), _nav_label(s["title"])) for s in rep.sections
+                                          if not all(it["t"] in ("kpis", "findings") for it in s["items"])]
+    parts.append('<nav><div class="wrap">%s</div></nav>' % "".join(
+        '<a href="#%s">%s</a>' % (h, _e(l)) for h, l in nav))
+    parts.append('<main class="wrap">')
+    for s in rep.sections:
+        for it in s["items"]:
+            if it["t"] == "kpis":
+                parts.append('<div class="kpis">%s</div>' % "".join(
+                    '<div class="kpi"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></div>'
+                    % (_e(l), _e(v), _e(sub)) for l, v, sub in it["items"]))
+            elif it["t"] == "findings":
+                body = ('<div class="finding"><span class="ok">&#10004;</span><span>Nothing notable found by the built-in checks.</span></div>'
+                        if not it["items"] else "".join(
+                            '<div class="finding"><span class="badge %s">%s</span><span>%s</span></div>'
+                            % (sev, SEVERITY[sev][0], _e(text)) for sev, text in it["items"]))
+                parts.append('<section id="findings"><h2>Findings <span class="note" style="font-weight:400;color:var(--mute)">'
+                             '(heuristics - verify before acting)</span></h2><div class="findings">%s</div></section>' % body)
+    for s in rep.sections:
+        if all(it["t"] in ("kpis", "findings") for it in s["items"]):
+            continue
+        parts.append('<section id="%s"><h2>%s</h2>' % (_slug(s["title"]), _e(s["title"])))
+        i, items = 0, s["items"]
+        while i < len(items):
+            it = items[i]
+            t = it["t"]
+            if t == "kv":
+                rows = []
+                while i < len(items) and items[i]["t"] == "kv":
+                    rows.append("<dt>%s</dt><dd>%s</dd>" % (_e(items[i]["k"]), _e(items[i]["v"])))
+                    i += 1
+                parts.append('<dl class="kv">%s</dl>' % "".join(rows))
+                continue
+            if t == "table":
+                cards = []
+                while i < len(items) and items[i]["t"] == "table":
+                    cards.append(_html_table(items[i]))
+                    i += 1
+                parts.append('<div class="tables">%s</div>' % "".join(cards))
+                continue
+            if t == "donut":
+                ds = []
+                while i < len(items) and items[i]["t"] == "donut":
+                    ds.append(_svg_donut(items[i]["title"], items[i]["pairs"]))
+                    i += 1
+                parts.append('<div class="donuts">%s</div>' % "".join(ds))
+                continue
+            if t == "note":
+                if not it.get("text_only"):
+                    parts.append('<p class="note">%s</p>' % _e(it["text"]))
+            elif t == "timeline":
+                parts.append("<h3>Traffic over time (bandwidth)</h3>" + _svg_timeline(it["per_second"]))
+            elif t == "graph":
+                parts.append("<h3>Conversation map (top hosts)</h3>" + _svg_graph(it))
+            i += 1
+        parts.append("</section>")
+    parts.append("</main><script>%s</script></body></html>" % HTML_JS)
+    return "".join(parts)
 
 
 def pct(n, total):
@@ -926,25 +1430,31 @@ def top(counter, n, total=None, label=None):
     return rows
 
 
-def spark_series(per_second, width=60):
-    if not per_second:
-        return ""
-    lo, hi = min(per_second), max(per_second)
-    span = hi - lo + 1
-    bins = [0] * width
-    for sec, b in per_second.items():
-        bins[min(width - 1, int((sec - lo) * width / span))] += b
-    mx = max(bins) or 1
-    return "".join(SPARKS[min(7, int(b / mx * 7.999))] if b else " " for b in bins)
-
-
 def build_report(a, path, topn):
     R = Report()
     m = a.meta
+    R.meta = {"path": path, "format": m.get("format", "?")}
     dur = (a.last_ts - a.first_ts) if a.first_ts is not None else 0
+    ips = set(a.ip_tx_p) | set(a.ip_rx_p)
+    obs = observations(a, dur)
+    nhigh = sum(1 for o in obs if o[0] == "high")
+    nmed = sum(1 for o in obs if o[0] == "medium")
 
     # ---- summary
     s = R.section("SUMMARY")
+    ipv4 = a.ip_ver.get("IPv4", 0)
+    ipv6 = a.ip_ver.get("IPv6", 0)
+    rate = human_bps(a.bytes * 8 / dur) if dur > 0 else "-"
+    R.kpis(s, [
+        ("PACKETS", "{:,}".format(a.pkts), "%s truncated" % pct(a.truncated, a.pkts) if a.truncated else "none truncated"),
+        ("DATA", human_bytes(a.bytes), "{:,} bytes".format(a.bytes)),
+        ("DURATION", "%.2f s" % dur if dur < 100 else "%.1f min" % (dur / 60), rate + " avg"),
+        ("HOSTS", "{:,}".format(len(ips)), "%d IPv4, %d IPv6 pkts" % (ipv4, ipv6) if ipv6 else "IPv4 only"),
+        ("FLOWS", "{:,}".format(len(a.flows)), "TCP + UDP"),
+        ("FINDINGS", "%d" % len(obs), "%d high, %d medium" % (nhigh, nmed)),
+    ])
+    R.findings(s, obs)
+    R.note(s, "Findings are heuristics - verify before acting.", text_only=True)
     R.kv(s, "File", path)
     R.kv(s, "Format", m.get("format", "?"))
     R.kv(s, "Packets", "{:,}".format(a.pkts))
@@ -955,7 +1465,6 @@ def build_report(a, path, topn):
         R.kv(s, "Duration", "%.3f s" % dur)
         if dur > 0:
             R.kv(s, "Average rate", "%s, %.1f packets/s" % (human_bps(a.bytes * 8 / dur), a.pkts / dur))
-    ips = set(a.ip_tx_p) | set(a.ip_rx_p)
     R.kv(s, "Unique IP addresses", "{:,}".format(len(ips)))
     R.kv(s, "Flows (TCP+UDP)", "{:,}".format(len(a.flows)))
     if m.get("warning"):
@@ -964,10 +1473,14 @@ def build_report(a, path, topn):
         R.kv(s, "Malformed/truncated", ", ".join("%s: %d" % kv for kv in a.malformed.items()))
 
     # ---- protocol hierarchy
-    s = R.section("PROTOCOL HIERARCHY (protocol stack per packet)")
+    s = R.section("PROTOCOL HIERARCHY")
+    leaf = Counter()
+    for stack, n in a.stack_pkts.items():
+        leaf[stack.split(":")[-1].upper()] += n
+    R.donut(s, "Packets by top protocol", leaf.most_common())
     rows = [(k, "{:,}".format(v), pct(v, a.pkts), human_bytes(a.stack_bytes[k]))
             for k, v in a.stack_pkts.most_common(topn * 2)]
-    R.table(s, "Stack", ["Protocols", "Packets", "%", "Bytes"], rows)
+    R.table(s, "Protocol stack per packet", ["Protocols", "Packets", "%", "Bytes"], rows)
 
     # ---- L1
     s = R.section("LAYER 1 - CAPTURE / PHYSICAL")
@@ -994,7 +1507,7 @@ def build_report(a, path, topn):
     if a.per_second:
         peak_sec, peak = max(a.per_second.items(), key=lambda kv: kv[1])
         R.kv(s, "Busiest second", "%s  (%s)" % (fmt_ts(peak_sec)[11:19], human_bps(peak * 8)))
-        R.kv(s, "Traffic over time", "|" + spark_series(a.per_second) + "|")
+        R.timeline(s, a.per_second)
     R.note(s, "A capture file does not contain real physical-layer data (speed, duplex, signal, errors);")
     R.note(s, "the values above are what the capture itself records.")
 
@@ -1021,24 +1534,39 @@ def build_report(a, path, topn):
         return "%s  (%s)" % (ip, n) if n else ip
 
     def ip_rows(pk, by, n):
-        rows = []
-        for ip, v in by.most_common(n):
-            rows.append((named(ip), ip_class(ip), "{:,}".format(pk[ip]), human_bytes(v), pct(v, a.bytes)))
-        return rows
+        return [(named(ip), ip_class(ip), "{:,}".format(pk[ip]), human_bytes(v), pct(v, a.bytes))
+                for ip, v in by.most_common(n)]
     R.table(s, "Top senders (by bytes)", ["IP", "Class", "Packets", "Bytes", "% of traffic"],
             ip_rows(a.ip_tx_p, a.ip_tx_b, topn))
     R.table(s, "Top receivers (by bytes)", ["IP", "Class", "Packets", "Bytes", "% of traffic"],
             ip_rows(a.ip_rx_p, a.ip_rx_b, topn))
     tot_ip = {ip: a.ip_tx_p[ip] + a.ip_rx_p[ip] for ip in ips}
     tb = {ip: a.ip_tx_b[ip] + a.ip_rx_b[ip] for ip in ips}
+    ranked = sorted(tb.items(), key=lambda kv: -kv[1])
     R.table(s, "Most active IPs (sent + received)", ["IP", "Class", "Packets", "Bytes"],
-            [(named(ip), ip_class(ip), "{:,}".format(tot_ip[ip]), human_bytes(v))
-             for ip, v in sorted(tb.items(), key=lambda kv: -kv[1])[:topn]])
+            [(named(ip), ip_class(ip), "{:,}".format(tot_ip[ip]), human_bytes(v)) for ip, v in ranked[:topn]])
     R.table(s, "Top conversations (IP pairs, by bytes)", ["Host A", "Host B", "Packets", "Bytes"],
             [(x, y, "{:,}".format(a.conv_p[(x, y)]), human_bytes(v)) for (x, y), v in a.conv_b.most_common(topn)])
-    cls = Counter()
-    for ip in ips:
-        cls[ip_class(ip)] += 1
+
+    # conversation map: nodes = busiest hosts, edges between them, hubs = biggest hosts with their peers
+    keep = [ip for ip, _ in ranked[:24]]
+    keepset = set(keep)
+    nodes = [{"ip": ip, "label": named(ip) if len(named(ip)) <= 34 else ip, "cls": ip_class(ip),
+              "bytes": tb[ip], "pkts": tot_ip[ip]} for ip in keep]
+    edges = [(x, y, by, a.conv_p[(x, y)]) for (x, y), by in a.conv_b.most_common(400)
+             if x in keepset and y in keepset][:60]
+    peers = defaultdict(list)
+    for (x, y), by in a.conv_b.items():
+        peers[x].append((y, by))
+        peers[y].append((x, by))
+    hubs = []
+    for ip, _ in ranked[:4]:
+        pl = sorted(peers[ip], key=lambda p: -p[1])[:5]
+        hubs.append({"ip": ip, "label": named(ip), "cls": ip_class(ip), "bytes": tb[ip],
+                     "peers": [(named(p), by, a.conv_p[(ip, p) if (ip, p) in a.conv_p else (p, ip)]) for p, by in pl]})
+    R.graph(s, nodes, edges, hubs)
+
+    cls = Counter(ip_class(ip) for ip in ips)
     R.table(s, "Address classes (unique IPs)", ["Class", "IPs", "%"], top(cls, 6))
     R.table(s, "TTL / hop limit values", ["TTL", "Packets", "%"], top(a.ttl, 6, label=lambda t: "%d (%s)" % (t, _ttl_guess(t))))
     if a.dscp:
@@ -1051,7 +1579,7 @@ def build_report(a, path, topn):
 
     # ---- L4
     s = R.section("LAYER 4 - TRANSPORT (TCP / UDP)")
-    R.table(s, "Transport protocols", ["Protocol", "Packets", "%"], top(a.l4, 8))
+    R.donut(s, "Transport protocols", a.l4.most_common())
     svc = lambda p: "%d  %s" % (p, SERVICES.get(p, ""))
     R.table(s, "Top TCP destination ports (SYNs = connection attempts)", ["Port", "SYNs", "%"],
             top(a.tcp_dport, topn, label=svc))
@@ -1060,7 +1588,7 @@ def build_report(a, path, topn):
     R.table(s, "TCP flag combinations", ["Flags", "Packets", "%"], top(a.tcp_flags, topn))
     tcp_flows = [(k, v) for k, v in a.flows.items() if v[2] == "tcp"]
     udp_flows = [(k, v) for k, v in a.flows.items() if v[2] == "udp"]
-    est = sum(1 for k, st in a.tcp_state.items() if st[4])
+    est = sum(1 for st in a.tcp_state.values() if st[4])
     syn_only = sum(1 for st in a.tcp_state.values() if st[0] and not st[1])
     R.kv(s, "TCP flows / UDP flows", "{:,} / {:,}".format(len(tcp_flows), len(udp_flows)))
     R.kv(s, "TCP handshakes completed", "{:,}".format(est))
@@ -1072,12 +1600,9 @@ def build_report(a, path, topn):
     R.kv(s, "Zero-window packets", "{:,}".format(a.zero_win))
 
     def flow_rows(flows):
-        rows = []
-        for (x, y), v in sorted(flows, key=lambda kv: -kv[1][1])[:topn]:
-            rows.append(("%s:%d" % x if ":" not in x[0] else "[%s]:%d" % x,
-                         "%s:%d" % y if ":" not in y[0] else "[%s]:%d" % y,
-                         "{:,}".format(v[0]), human_bytes(v[1])))
-        return rows
+        fmt = lambda e: "%s:%d" % e if ":" not in e[0] else "[%s]:%d" % e
+        return [(fmt(x), fmt(y), "{:,}".format(v[0]), human_bytes(v[1]))
+                for (x, y), v in sorted(flows, key=lambda kv: -kv[1][1])[:topn]]
     R.table(s, "Top TCP flows (by bytes)", ["Endpoint A", "Endpoint B", "Packets", "Bytes"], flow_rows(tcp_flows))
     R.table(s, "Top UDP flows (by bytes)", ["Endpoint A", "Endpoint B", "Packets", "Bytes"], flow_rows(udp_flows))
 
@@ -1113,15 +1638,6 @@ def build_report(a, path, topn):
     R.table(s, "Service banners", ["Banner", "Count", "%"], top(a.banners, 8))
     if a.ntp:
         R.kv(s, "NTP packets", "{:,}".format(a.ntp))
-
-    # ---- observations
-    s = R.section("OBSERVATIONS (heuristics - verify before acting)")
-    obs = observations(a, dur)
-    if obs:
-        for o in obs:
-            R.note(s, "- " + o)
-    else:
-        R.note(s, "Nothing notable found by the built-in checks.")
     return R
 
 
@@ -1136,6 +1652,7 @@ def _ttl_guess(t):
 
 
 def observations(a, dur):
+    """Heuristic findings as (severity, text); severity is high / medium / info."""
     out = []
     for src, targets in a.syn_targets.items():
         unanswered = [t for t in targets if (src, t[0], t[1]) not in a.answered]
@@ -1143,43 +1660,43 @@ def observations(a, dur):
         ports = {t[1] for t in unanswered}
         if len(unanswered) >= 20 and len(unanswered) >= 0.8 * len(targets):
             kind = "port scan" if len(ports) > len(hosts) else "host sweep"
-            out.append("Possible TCP %s from %s: %d unanswered SYNs to %d host(s) / %d port(s)." % (
-                kind, src, len(unanswered), len(hosts), len(ports)))
+            out.append(("high", "Possible TCP %s from %s: %d unanswered SYNs to %d host(s) / %d port(s)." % (
+                kind, src, len(unanswered), len(hosts), len(ports))))
     tcp_pk = a.l4.get("TCP", 0)
     if tcp_pk > 100 and a.retrans / tcp_pk > 0.02:
-        out.append("High TCP retransmission rate: %s of TCP packets (possible loss/congestion)." % pct(a.retrans, tcp_pk))
+        out.append(("medium", "High TCP retransmission rate: %s of TCP packets (possible loss/congestion)." % pct(a.retrans, tcp_pk)))
     if tcp_pk > 100 and a.rst / tcp_pk > 0.05:
-        out.append("Many TCP resets: %s of TCP packets (refused ports, aborted sessions or a scan)." % pct(a.rst, tcp_pk))
+        out.append(("medium", "Many TCP resets: %s of TCP packets (refused ports, aborted sessions or a scan)." % pct(a.rst, tcp_pk)))
     if a.zero_win:
-        out.append("%d zero-window packets: a receiver could not keep up." % a.zero_win)
+        out.append(("medium", "%d zero-window packets: a receiver could not keep up." % a.zero_win))
     for what, n in a.cleartext.items():
         hosts = ", ".join(sorted(a.cleartext_hosts[what])[:5])
-        out.append("Cleartext traffic: %s (%d packets) to/from %s - credentials/data may be readable." % (what, n, hosts))
+        out.append(("high", "Cleartext traffic: %s (%d packets) to/from %s - credentials/data may be readable." % (what, n, hosts)))
     for what, n in a.tls_old.items():
-        out.append("Deprecated TLS: %d handshake(s) where the %s." % (n, what))
+        out.append(("medium", "Deprecated TLS: %d handshake(s) where the %s." % (n, what)))
     nx = a.dns_rcode.get("NXDOMAIN", 0)
     if a.dns_responses >= 20 and nx / a.dns_responses > 0.3:
-        out.append("%s of DNS responses are NXDOMAIN (possible DGA/malware or misconfiguration)." % pct(nx, a.dns_responses))
+        out.append(("medium", "%s of DNS responses are NXDOMAIN (possible DGA/malware or misconfiguration)." % pct(nx, a.dns_responses)))
     if len(a.dns_long) >= 5:
-        out.append("%d DNS queries with very long names (e.g. %s) - check for DNS tunnelling." % (len(a.dns_long), a.dns_long[0][:60]))
+        out.append(("medium", "%d DNS queries with very long names (e.g. %s) - check for DNS tunnelling." % (len(a.dns_long), a.dns_long[0][:60])))
     if a.dns_qtype.get("TXT", 0) > 20 or a.dns_qtype.get("ANY", 0) > 5:
-        out.append("Unusual DNS types: TXT=%d ANY=%d." % (a.dns_qtype.get("TXT", 0), a.dns_qtype.get("ANY", 0)))
+        out.append(("info", "Unusual DNS types: TXT=%d ANY=%d." % (a.dns_qtype.get("TXT", 0), a.dns_qtype.get("ANY", 0))))
     for ip, macs in a.arp_map.items():
         if len(macs) > 1:
-            out.append("ARP: %s claimed by %d different MACs (%s) - conflict or ARP spoofing." % (ip, len(macs), ", ".join(sorted(macs))))
+            out.append(("high", "ARP: %s claimed by %d different MACs (%s) - conflict or ARP spoofing." % (ip, len(macs), ", ".join(sorted(macs)))))
     if a.arp_gratuitous > 5:
-        out.append("%d gratuitous ARP packets." % a.arp_gratuitous)
+        out.append(("info", "%d gratuitous ARP packets." % a.arp_gratuitous))
     echo = a.icmp.get("echo-request (type 8 code 0)", 0)
     if echo > 100 and dur > 0 and echo / dur > 50:
-        out.append("ICMP echo-request rate %.0f/s (ping flood or sweep)." % (echo / dur))
+        out.append(("medium", "ICMP echo-request rate %.0f/s (ping flood or sweep)." % (echo / dur)))
     if a.udp_port_unreach > 20:
-        out.append("%d ICMP port-unreachable messages (UDP to closed ports, possible UDP scan)." % a.udp_port_unreach)
+        out.append(("info", "%d ICMP port-unreachable messages (UDP to closed ports, possible UDP scan)." % a.udp_port_unreach))
     if a.frags > 0:
-        out.append("%d fragmented IP packets (check MTU issues or evasion)." % a.frags)
+        out.append(("info", "%d fragmented IP packets (check MTU issues or evasion)." % a.frags))
     if a.truncated:
-        out.append("%d packets are truncated by the snap length; payload analysis is incomplete for them." % a.truncated)
+        out.append(("info", "%d packets are truncated by the snap length; payload analysis is incomplete for them." % a.truncated))
     if a.malformed:
-        out.append("Malformed packets: " + ", ".join("%s (%d)" % kv for kv in a.malformed.items()) + ".")
+        out.append(("info", "Malformed packets: " + ", ".join("%s (%d)" % kv for kv in a.malformed.items()) + "."))
     return out
 
 
@@ -1187,11 +1704,15 @@ def observations(a, dur):
 
 def main():
     ap = argparse.ArgumentParser(description="Analyze a pcap/pcapng capture and print a text report "
-                                 "(top IPs, protocols, layers 1-7, observations).")
+                                 "(top IPs, protocols, layers 1-7, findings), optionally as an HTML report.")
     ap.add_argument("pcap", help="capture file (.pcap, .pcapng, optionally .gz)")
     ap.add_argument("-n", "--top", type=int, default=10, help="rows per top-list (default 10)")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
-    ap.add_argument("-o", "--output", help="write the report to this file as well")
+    ap.add_argument("--html", metavar="FILE", help="also write a self-contained HTML report with charts")
+    ap.add_argument("-q", "--quiet", action="store_true", help="with --html/-o: do not print the report to the terminal")
+    ap.add_argument("-o", "--output", help="write the plain-text report to this file as well")
+    ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
+                    help="colors in terminal output (default auto; NO_COLOR is respected)")
     args = ap.parse_args()
 
     a = Analyzer()
@@ -1211,8 +1732,21 @@ def main():
         sys.exit("error: no packets found in %s" % args.pcap)
 
     rep = build_report(a, args.pcap, max(1, args.top))
-    text = json.dumps(rep.to_json(), indent=2, default=str) + "\n" if args.json else rep.to_text()
-    sys.stdout.write(text)
+    if args.html:
+        with open(args.html, "w", encoding="utf-8") as f:
+            f.write(rep.to_html())
+        print("HTML report written to %s" % args.html, file=sys.stderr)
+    tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+    color = args.color == "always" or (args.color == "auto" and tty)
+    width = max(80, min(120, shutil.get_terminal_size((100, 24)).columns)) if sys.stdout.isatty() else 100
+    if args.json:
+        text = json.dumps(rep.to_json(), indent=2, default=str) + "\n"
+        shown = text
+    else:
+        text = rep.to_text(Style(False), width)
+        shown = rep.to_text(Style(True), width) if color else text
+    if not (args.quiet and (args.html or args.output)):
+        sys.stdout.write(shown)
     if args.output:
         with open(args.output, "w") as f:
             f.write(text)

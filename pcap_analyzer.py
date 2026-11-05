@@ -969,6 +969,7 @@ class Analyzer:
         self.ev, self.evn = defaultdict(list), Counter()
         self._ports, self._fkey, self._seq, self._dkey = (0, 0), None, 0, None
         # L2 extras
+        self.sec_info = {}                      # second -> [first pkt no, last pkt no, packets, Counter(protocol)]
         self.pkts_ps, self.bcast_ps, self.mcast_ps, self.arp_req_ps = Counter(), Counter(), Counter(), Counter()
         self.neighbors = {}
         self.stp_msgs, self.stp_roots, self.stp_bridges = Counter(), Counter(), set()
@@ -1031,6 +1032,14 @@ class Analyzer:
         name = ":".join(stack)
         self.stack_pkts[name] += 1
         self.stack_bytes[name] += origlen
+        if ts is not None:
+            sec = int(ts)
+            si = self.sec_info.get(sec)
+            if si is None:
+                si = self.sec_info[sec] = [self.cur, self.cur, 0, Counter()]
+            si[0], si[1] = min(si[0], self.cur), max(si[1], self.cur)
+            si[2] += 1
+            si[3][stack[-1].upper()] += 1
 
     def decode_link(self, link, data, origlen, stack):
         if link == 1:
@@ -1858,6 +1867,7 @@ def bin_series(per_second, n):
     """Rebin {epoch_second: bytes} into n bins -> (bins, start, end, seconds_per_bin)."""
     lo, hi = min(per_second), max(per_second)
     span = hi - lo + 1
+    n = max(1, min(n, span))                      # data has 1 s resolution: never make bins shorter than a second
     bins = [0] * n
     for sec, b in per_second.items():
         bins[min(n - 1, int((sec - lo) * n / span))] += b
@@ -1927,9 +1937,9 @@ class Report:
         sec["items"].append({"t": "findings", "items": sorted(items, key=lambda x: SEVERITY[x.sev][2])})
 
     @staticmethod
-    def timeline(sec, per_second):
+    def timeline(sec, per_second, info=None):
         if per_second:
-            sec["items"].append({"t": "timeline", "per_second": per_second})
+            sec["items"].append({"t": "timeline", "per_second": per_second, "info": info or {}})
 
     @staticmethod
     def donut(sec, title, pairs):
@@ -2053,7 +2063,10 @@ class Report:
     def _timeline_text(st, per_second, width):
         n = max(20, min(80, width - 20))
         bins, lo, hi, bs = bin_series(per_second, n)
-        rows = tall_chart(bins, 4)
+        n = len(bins)
+        k = max(1, min(6, 48 // n))                   # few bins (short capture): stretch columns so the chart stays readable
+        rows = ["".join(ch * k for ch in row) for row in tall_chart(bins, 4)]
+        n *= k
         peak = human_bps(max(bins) * 8 / bs)
         out = ["", "  " + st("bold", "Traffic over time") + st("dim", "  (bandwidth per %.2f s)" % bs)]
         for i, r in enumerate(rows):
@@ -2171,6 +2184,10 @@ main{padding:20px 0 48px}
 a.kpi:hover{border-color:var(--c1);box-shadow:0 1px 8px rgba(37,99,235,.18)}
 a.lg{color:inherit;text-decoration:none;border-bottom:1px dotted var(--mute)}a.lg:hover{color:var(--c1);border-bottom-style:solid}
 .donut a circle:hover{opacity:.75}
+.chart.tl .hit{cursor:pointer;outline:none}.chart.tl .hit:hover,.chart.tl .hit:focus{fill:var(--c1);fill-opacity:.12}.chart.tl .hit.sel{fill:var(--c2);fill-opacity:.22}
+.tpanel{margin-top:8px;border:1px solid var(--line);border-radius:8px;padding:8px 12px;font-size:13px;min-height:40px}
+.tpanel .hint{color:var(--mute)}.tpanel dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 14px;margin:0}.tpanel dt{color:var(--mute)}.tpanel dd{margin:0;word-break:break-word}
+.tpanel code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;word-break:break-all}
 .kpi .l{font-size:12px;color:var(--mute);text-transform:uppercase;letter-spacing:.5px}
 .kpi .v{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums;margin:2px 0}
 .kpi .s{font-size:12px;color:var(--mute)}
@@ -2244,6 +2261,14 @@ a.totop.show{opacity:1;visibility:visible;transform:none}a.totop:hover{filter:br
 HTML_JS = """
 (function(){var r=document.documentElement,b=document.querySelector('.theme');
 if(b)b.onclick=function(){var d=r.getAttribute('data-theme')==='dark'||(!r.getAttribute('data-theme')&&matchMedia('(prefers-color-scheme: dark)').matches);r.setAttribute('data-theme',d?'light':'dark')};
+(function(){var P=document.getElementById('tpanel');if(!P)return;
+function show(h){document.querySelectorAll('.hit.sel').forEach(function(x){x.classList.remove('sel')});h.classList.add('sel');
+var d=h.dataset,rows=[['Window',d.win],['Packets','#'+d.pk.replace('-',' \u2013 #')+'  ('+Number(d.n).toLocaleString()+' packets)'],['Rate',d.rate],['Protocols',d.mix]];
+P.textContent='';var dl=document.createElement('dl');rows.forEach(function(r){var a=document.createElement('dt'),b=document.createElement('dd');a.textContent=r[0];b.textContent=r[1];dl.appendChild(a);dl.appendChild(b)});
+[['Wireshark filter',d.flt],['Extract','' + d.cmd]].forEach(function(r){var a=document.createElement('dt'),b=document.createElement('dd'),c=document.createElement('code'),k=document.createElement('button');a.textContent=r[0];c.textContent=r[1];
+k.type='button';k.className='copy';k.dataset.t=r[1];k.textContent='copy';b.appendChild(c);b.appendChild(document.createTextNode(' '));b.appendChild(k);dl.appendChild(a);dl.appendChild(b)});
+P.appendChild(dl)}
+document.querySelectorAll('.hit').forEach(function(h){h.addEventListener('click',function(){show(h)});h.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();show(h)}})})})();
 document.addEventListener('click',function(e){var b=e.target.closest('.copy');if(!b)return;var t=b.dataset.t;
 try{navigator.clipboard.writeText(t)}catch(x){var r=document.createRange();r.selectNodeContents(b.previousElementSibling);getSelection().removeAllRanges();getSelection().addRange(r)}
 b.textContent='copied';setTimeout(function(){b.textContent='copy'},1200)});
@@ -2338,15 +2363,23 @@ def _html_table(it):
     return "".join(out)
 
 
-def _svg_timeline(per_second):
+def _svg_timeline(per_second, info=None, t0=None, path=""):
     n = 120
     bins, lo, hi, bs = bin_series(per_second, n)
+    n = len(bins)
     rates = [b * 8 / bs for b in bins]
     mx = max(rates) or 1
+    # aggregate the per-second packet ranges / protocol mixes into the chart's bins
+    win = {}
+    for sec, (first, last, cnt, protos) in (info or {}).items():
+        j = min(n - 1, int((sec - lo) * n / (hi - lo)))
+        w = win.setdefault(j, [first, last, 0, Counter()])
+        w[0], w[1], w[2] = min(w[0], first), max(w[1], last), w[2] + cnt
+        w[3].update(protos)
     W, H, L, B, T, Rr = 900, 210, 70, 28, 10, 10
     pw, ph = W - L - Rr, H - T - B
     bw = pw / n
-    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Traffic over time">' % (W, H)]
+    out = ['<svg class="chart tl" viewBox="0 0 %d %d" role="img" aria-label="Traffic over time (click a bar for details)">' % (W, H)]
     for k in range(5):
         y = T + ph - ph * k / 4
         out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--line)"/>' % (L, W - Rr, y, y))
@@ -2355,13 +2388,27 @@ def _svg_timeline(per_second):
         if r <= 0:
             continue
         h = max(1.0, ph * r / mx)
-        t0 = fmt_ts(lo + i * bs)[11:19]
-        out.append('<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" fill="var(--c1)" rx="1"><title>%s UTC - %s</title></rect>'
-                   % (L + i * bw, T + ph - h, max(1.0, bw - 1), h, _e(t0), _e(human_bps(r))))
+        ws, we = lo + i * bs, lo + (i + 1) * bs
+        out.append('<rect class="tbar" x="%.2f" y="%.2f" width="%.2f" height="%.2f" fill="var(--c1)" rx="1"/>'
+                   % (L + i * bw, T + ph - h, max(1.0, bw - 1), h))
+        w = win.get(i)
+        if w:
+            rel0, rel1 = max(0.0, ws - (t0 if t0 is not None else lo)), max(0.0, we - (t0 if t0 is not None else lo))
+            mix = ", ".join("%s %.0f%%" % (k, 100.0 * v / w[2]) for k, v in w[3].most_common(4))
+            sub = ".%03d" % int((ws % 1) * 1000) if bs < 1 else ""
+            subx = ".%03d" % int((we % 1) * 1000) if bs < 1 else ""
+            cmd = "pcap_analyzer.py %s --from +%.3f --to +%.3f --extract window.pcap" % (shlex.quote(path), rel0, rel1)
+            out.append('<rect class="hit" x="%.2f" y="%d" width="%.2f" height="%d" fill="transparent" tabindex="0" role="button" '
+                       'data-win="%s" data-pk="%d-%d" data-n="%d" data-rate="%s" data-mix="%s" data-flt="frame.number >= %d && frame.number <= %d" '
+                       'data-cmd="%s"><title>%s UTC - %s (click for details)</title></rect>'
+                       % (L + i * bw, T, bw, ph, _e("%s%s \u2192 %s%s UTC" % (fmt_ts(ws)[11:19], sub, fmt_ts(we)[11:19], subx)),
+                          w[0], w[1], w[2], _e(human_bps(r)), _e(mix), w[0], w[1], _e(cmd), _e(fmt_ts(ws)[11:19]), _e(human_bps(r))))
     for frac, anchor in ((0, "start"), (0.5, "middle"), (1, "end")):
         x = L + pw * frac
         out.append('<text x="%.1f" y="%d" text-anchor="%s">%s</text>' % (x, H - 8, anchor, _e(fmt_ts(lo + (hi - lo) * frac)[11:19] + " UTC")))
     out.append("</svg>")
+    out.append('<div class="tpanel" id="tpanel" aria-live="polite"><span class="hint">Click a bar to see that time window: '
+               'packet range, protocol mix, a Wireshark filter and an extract command.</span></div>')
     return "".join(out)
 
 
@@ -2676,7 +2723,7 @@ def render_html(rep):
                 if not it.get("text_only"):
                     parts.append('<p class="note">%s</p>' % _e(it["text"]))
             elif t == "timeline":
-                parts.append("<h3>Traffic over time (bandwidth)</h3>" + _svg_timeline(it["per_second"]))
+                parts.append("<h3>Traffic over time (bandwidth)</h3>" + _svg_timeline(it["per_second"], it.get("info"), rep.meta.get("t0"), rep.meta.get("path", "")))
             elif t == "graph":
                 parts.append("<h3>Conversation map (top hosts)</h3>" + _svg_graph(it))
             i += 1
@@ -2701,7 +2748,7 @@ def build_report(a, path, topn, whois=None, traces=None, filter_desc=None):
     W = whois or {}
     R = Report()
     m = a.meta
-    R.meta = {"path": path, "format": m.get("format", "?")}
+    R.meta = {"path": path, "format": m.get("format", "?"), "t0": a.first_ts}
     dur = (a.last_ts - a.first_ts) if a.first_ts is not None else 0
     ips = set(a.ip_tx_p) | set(a.ip_rx_p)
     obs = observations(a, dur)
@@ -2780,7 +2827,7 @@ def build_report(a, path, topn, whois=None, traces=None, filter_desc=None):
     if a.per_second:
         peak_sec, peak = max(a.per_second.items(), key=lambda kv: kv[1])
         R.kv(s, "Busiest second", "%s  (%s)" % (fmt_ts(peak_sec)[11:19], human_bps(peak * 8)))
-        R.timeline(s, a.per_second)
+        R.timeline(s, a.per_second, a.sec_info)
     R.note(s, "A capture file does not contain real physical-layer data (speed, duplex, signal, errors);")
     R.note(s, "the values above are what the capture itself records.")
 

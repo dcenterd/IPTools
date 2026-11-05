@@ -11,7 +11,26 @@ Limits: packets are decoded one by one (no TCP reassembly), so L7 details are on
 extracted when they sit in a single packet. The capture file has no real physical-layer
 data; "Layer 1" shows what the capture itself records (link type, sizes, timing).
 
-Usage: pcap_analyzer.py capture.pcap [--top N] [--json] [-o report.txt]
+Usage: pcap_analyzer.py capture.pcap [options]
+
+Output:
+  -n, --top N        rows per top-list (default 10)
+  --json             print JSON instead of text
+  --html FILE        also write a self-contained HTML report with charts
+  -o, --output FILE  write the plain-text report to this file as well
+  -q, --quiet        with --html/-o/--extract: do not print the report to the terminal
+  --whois            look up ASN/org/country of public IPs (sends them to whois.cymru.com)
+  --color WHEN       auto (default), always or never; NO_COLOR is respected
+  --no-trace         skip the flow-trace pass (it reads the capture a second time)
+
+Filters (applied while reading; packet numbers stay those of the original file):
+  --host IP          only packets to/from this IP (repeatable)
+  --port N           only TCP/UDP packets using this port (repeatable)
+  --proto P          only tcp, udp, icmp, icmpv6 or arp (repeatable)
+  --flow A,B         only one conversation: IP:PORT,IP:PORT or [IPv6]:PORT,... (repeatable)
+  --from TIME        start of window: +SECONDS after first packet, HH:MM:SS or 'YYYY-MM-DD HH:MM:SS' (UTC)
+  --to TIME          end of window (same formats as --from)
+  --extract FILE     write the packets that pass the filters to a new pcap (open in Wireshark)
 """
 import argparse
 import gzip

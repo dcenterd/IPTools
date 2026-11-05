@@ -69,6 +69,14 @@ pip install -r requirements.txt
 ./cve_checker.py --days 7 --severity high
 ./cve_checker.py --keyword "PHP before" --days 30
 ./cve_checker.py --kev                     # only actively exploited
+
+# traceroute / ping / MTU / port scan (Linux, no root)
+./ipx.py 8.8.8.8 --asn                     # trace with ASN/org/country per hop
+./ipx.py example.org -T --port 443 --mtu   # TCP trace, then path MTU
+./ipx.py 8.8.8.8 1.1.1.1 --compare         # compare hosts/protocols
+./ipx.py 8.8.8.8 --live                    # live per-hop stats
+./ipx.py 8.8.8.8 --ping -c 10
+./ipx.py example.org --scan 22,80,443 --open
 ```
 
 ### Country list to MikroTik

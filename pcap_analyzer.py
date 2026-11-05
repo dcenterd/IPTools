@@ -15,6 +15,7 @@ Usage: pcap_analyzer.py capture.pcap [--top N] [--json] [-o report.txt]
 """
 import argparse
 import gzip
+import hashlib
 import html
 import ipaddress
 import json
@@ -22,12 +23,13 @@ import math
 import os
 import random
 import re
+import shlex
 import shutil
 import socket
 import struct
 import sys
 import textwrap
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque, namedtuple
 from datetime import datetime, timezone
 
 SPARKS = "▁▂▃▄▅▆▇█"
@@ -274,7 +276,620 @@ def read_dns_name(data, off):
     return None, end
 
 
+# ------------------------------------------------------------------ analysis helpers
+
+MASK32 = 0xFFFFFFFF
+GREASE = {0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A,
+          0x8A8A, 0x9A9A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA}
+Finding = namedtuple("Finding", "sev text filt pkts total")
+
+
+def before(a, b):
+    """True if TCP sequence number a is before b (32-bit wraparound)."""
+    return ((a - b) & MASK32) > 0x80000000
+
+
+def pctl(vals, p):
+    """p-th percentile of a sorted list (linear interpolation)."""
+    if not vals:
+        return None
+    k = (len(vals) - 1) * p / 100.0
+    f = int(k)
+    c = min(f + 1, len(vals) - 1)
+    return vals[f] + (vals[c] - vals[f]) * (k - f)
+
+
+def lat_stats(samples):
+    """samples in ms -> (n, min, median, p95, max) or None."""
+    if not samples:
+        return None
+    v = sorted(samples)
+    return len(v), v[0], pctl(v, 50), pctl(v, 95), v[-1]
+
+
+def fmt_ms(v):
+    if v is None:
+        return "-"
+    if v >= 1000:
+        return "%.2f s" % (v / 1000.0)
+    return "%.1f ms" % v if v < 100 else "%.0f ms" % v
+
+
+def flow_filter(a, b, proto="tcp"):
+    """Wireshark display filter for one conversation between endpoints (ip, port)."""
+    fam = "ipv6" if ":" in a[0] else "ip"
+    return "%s.addr==%s && %s.addr==%s && %s.port==%d && %s.port==%d" % (fam, a[0], fam, b[0], proto, a[1], proto, b[1])
+
+
+class TcpFlow:
+    """State of one TCP connection: handshake, RTT samples, retransmissions, dup-ACKs, windows, options."""
+    __slots__ = ("ep", "first", "last", "pkts", "bytes", "payload", "syn", "synack", "hsack", "rtts",
+                 "retrans", "ooo", "dupack", "zwin", "rst", "fin", "closed", "rst_by", "max_seg", "retx_big",
+                 "nxt", "seen", "unacked", "last_ack", "last_win", "mss", "ws", "sack", "tsopt", "ecn",
+                 "established", "pk", "sni", "idx", "n0")
+
+    def __init__(self, client, server, idx=0):
+        self.ep = (client, server)
+        self.first = self.last = None
+        self.pkts, self.bytes, self.payload = [0, 0], [0, 0], [0, 0]
+        self.syn = self.synack = self.hsack = None
+        self.rtts = ([], [])
+        self.retrans = self.ooo = self.dupack = self.zwin = self.rst = self.fin = 0
+        self.closed = self.rst_by = None
+        self.max_seg = self.retx_big = 0
+        self.nxt = [None, None]
+        self.seen = (set(), set())
+        self.unacked = ({}, {})
+        self.last_ack = [None, None]
+        self.last_win = [None, None]
+        self.mss, self.ws = [None, None], [None, None]
+        self.sack, self.tsopt = [False, False], [False, False]
+        self.ecn = False
+        self.established = False
+        self.pk = []
+        self.sni = ""
+        self.idx = idx
+        self.n0 = None
+
+    def direction(self, src, sport):
+        return 0 if self.ep[0] == (src, sport) else 1
+
+    def update(self, ts, n, d, seq, ack, flags, win, plen, wire, opts=None):
+        """Feed one packet; returns a tuple of event marks (retransmission, dup-ack, ...)."""
+        marks = []
+        if self.n0 is None:
+            self.n0 = n
+        if ts is not None:
+            if self.first is None:
+                self.first = ts
+            self.last = ts
+        self.pkts[d] += 1
+        self.bytes[d] += wire
+        self.payload[d] += plen
+        syn, ackf = flags & 0x02, flags & 0x10
+        if syn and not ackf:
+            if self.syn is None:
+                self.syn = ts
+            if flags & 0xC0:
+                self.ecn = True
+        elif syn and ackf:
+            if self.synack is None:
+                self.synack = ts
+        elif (ackf and d == 0 and self.syn is not None and self.synack is not None and self.hsack is None):
+            self.hsack = ts
+            self.established = True
+        if opts:
+            self.mss[d] = opts.get("mss", self.mss[d])
+            self.ws[d] = opts.get("ws", self.ws[d])
+            self.sack[d] = opts.get("sack", self.sack[d])
+            self.tsopt[d] = opts.get("ts", self.tsopt[d])
+        if flags & 0x04:
+            self.rst += 1
+            self.closed, self.rst_by = "RST", d
+            marks.append("rst")
+        elif flags & 0x01:
+            self.fin += 1
+            if self.closed is None:
+                self.closed = "FIN"
+        if win == 0 and not (flags & 0x06):
+            self.zwin += 1
+            marks.append("zero-window")
+        seg = plen + (1 if flags & 0x03 else 0)
+        retx = False
+        if seg:
+            nxt = self.nxt[d]
+            if nxt is not None and before(seq, nxt):
+                if seq in self.seen[d]:
+                    self.retrans += 1
+                    retx = True
+                    marks.append("retransmission")
+                    if plen >= 1000:
+                        self.retx_big += 1
+                    self.unacked[d].pop((seq + seg) & MASK32, None)     # Karn: no RTT from retransmitted data
+                else:
+                    self.ooo += 1
+                    marks.append("out-of-order")
+            elif len(self.seen[d]) < 512:
+                self.seen[d].add(seq)
+            end = (seq + seg) & MASK32
+            if nxt is None or not before(end, nxt):
+                self.nxt[d] = end
+            if plen > self.max_seg:
+                self.max_seg = plen
+        if ackf and plen == 0 and not (flags & 0x07):
+            la = self.last_ack[d]
+            other = self.nxt[1 - d]
+            if la is not None and ack == la and win == self.last_win[d] and other is not None and before(ack, other):
+                self.dupack += 1
+                marks.append("dup-ack")
+        if ackf:
+            self.last_ack[d] = ack
+            self.last_win[d] = win
+            U = self.unacked[1 - d]
+            if U and ts is not None:
+                best = None
+                done = []
+                for end in U:
+                    if not before(ack, end):                    # end <= ack: this data is acknowledged
+                        done.append(end)
+                        if best is None or before(best, end):
+                            best = end
+                if best is not None:
+                    r = (ts - U[best]) * 1000.0
+                    lst = self.rtts[1 - d]
+                    if 0 <= r < 120000 and len(lst) < 300:
+                        lst.append(r)
+                for e in done:
+                    del U[e]
+        if seg and not retx and ts is not None:
+            U = self.unacked[d]
+            U[(seq + seg) & MASK32] = ts
+            if len(U) > 128:
+                U.pop(next(iter(U)))
+        if marks and len(self.pk) < 12:
+            self.pk.append(n)
+        return marks
+
+    # ---- derived values
+    @property
+    def duration(self):
+        return (self.last - self.first) if self.first is not None and self.last is not None else 0.0
+
+    @property
+    def handshake_ms(self):
+        if self.syn is not None and self.synack is not None:
+            return (self.synack - self.syn) * 1000.0
+        return None
+
+    @property
+    def rtt_ms(self):
+        """Network RTT estimate: the larger of the two directions' median data->ACK delay
+        (the direction whose ACKs come from the far side of the capture point)."""
+        meds = [pctl(sorted(l), 50) for l in self.rtts if l]
+        return max(meds) if meds else None
+
+    @property
+    def score(self):
+        s = self.retrans * 3 + self.dupack + self.zwin * 2 + self.ooo * 0.5
+        if self.rst:
+            s += 2
+        if self.syn is not None and self.synack is None:
+            s += 3
+        return s
+
+    @property
+    def blackhole(self):
+        return self.retrans >= 3 and self.max_seg >= 1000 and self.retx_big >= 0.8 * self.retrans
+
+    def end_state(self):
+        if self.closed == "RST":
+            return "RST by %s" % ("client" if self.rst_by == 0 else "server")
+        if self.closed == "FIN":
+            return "FIN"
+        if self.syn is not None and self.synack is None:
+            return "no SYN/ACK"
+        return "open"
+
+
+def parse_tcp_options(o):
+    """TCP options bytes -> {'mss', 'ws', 'sack', 'ts'}."""
+    res, i = {}, 0
+    while i < len(o):
+        k = o[i]
+        if k == 0:
+            break
+        if k == 1:
+            i += 1
+            continue
+        if i + 1 >= len(o) or o[i + 1] < 2:
+            break
+        ln = o[i + 1]
+        v = o[i + 2:i + ln]
+        if k == 2 and len(v) == 2:
+            res["mss"] = struct.unpack("!H", v)[0]
+        elif k == 3 and len(v) == 1:
+            res["ws"] = v[0]
+        elif k == 4:
+            res["sack"] = True
+        elif k == 8:
+            res["ts"] = True
+        i += ln
+    return res
+
+
+# ---- ASN.1 / X.509 (just enough to describe a server certificate)
+
+OIDS = {"2.5.4.3": "CN", "2.5.4.10": "O", "2.5.4.11": "OU", "2.5.4.6": "C", "2.5.4.7": "L", "2.5.4.8": "ST"}
+SIGALGS = {"1.2.840.113549.1.1.4": "md5WithRSA", "1.2.840.113549.1.1.5": "sha1WithRSA",
+           "1.2.840.113549.1.1.11": "sha256WithRSA", "1.2.840.113549.1.1.12": "sha384WithRSA",
+           "1.2.840.113549.1.1.13": "sha512WithRSA", "1.2.840.113549.1.1.10": "rsassa-pss",
+           "1.2.840.10045.4.3.2": "ecdsa-sha256", "1.2.840.10045.4.3.3": "ecdsa-sha384",
+           "1.2.840.10045.4.1": "ecdsa-sha1", "1.3.101.112": "ed25519"}
+CURVES = {"1.2.840.10045.3.1.7": "P-256", "1.3.132.0.34": "P-384", "1.3.132.0.35": "P-521"}
+
+
+def der_tlv(b, off):
+    """-> (tag, content_start, content_end)."""
+    tag = b[off]
+    ln = b[off + 1]
+    off += 2
+    if ln & 0x80:
+        n = ln & 0x7F
+        if n == 0 or n > 4:
+            raise ValueError("bad DER length")
+        ln = int.from_bytes(b[off:off + n], "big")
+        off += n
+    if off + ln > len(b):
+        raise ValueError("DER overrun")
+    return tag, off, off + ln
+
+
+def der_oid(b):
+    if not b:
+        return ""
+    parts = [b[0] // 40, b[0] % 40]
+    v = 0
+    for c in b[1:]:
+        v = (v << 7) | (c & 0x7F)
+        if not c & 0x80:
+            parts.append(v)
+            v = 0
+    return ".".join(str(x) for x in parts)
+
+
+def der_children(b, s, e):
+    out, p = [], s
+    while p < e:
+        tag, cs, ce = der_tlv(b, p)
+        out.append((tag, cs, ce))
+        p = ce
+    return out
+
+
+def der_name(b, s, e):
+    """RDNSequence content -> {'CN': ..., 'O': ...}."""
+    res = {}
+    for _t, ss, se in der_children(b, s, e):                 # each SET
+        for _t2, ps, pe in der_children(b, ss, se):          # each AttributeTypeAndValue SEQ
+            kids = der_children(b, ps, pe)
+            if len(kids) == 2 and kids[0][0] == 0x06:
+                key = OIDS.get(der_oid(b[kids[0][1]:kids[0][2]]))
+                if key and key not in res:
+                    res[key] = b[kids[1][1]:kids[1][2]].decode("utf-8", "replace")
+    return res
+
+
+def der_time(tag, v):
+    t = v.decode("ascii", "replace")
+    try:
+        if tag == 0x17:
+            yy = int(t[0:2])
+            y, rest = (2000 + yy if yy < 50 else 1900 + yy), t[2:]
+        else:
+            y, rest = int(t[0:4]), t[4:]
+        dt = datetime(y, int(rest[0:2]), int(rest[2:4]), int(rest[4:6]), int(rest[6:8]), int(rest[8:10]), tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, IndexError):
+        return None
+
+
+def parse_certificate(der):
+    """Minimal X.509 reader -> dict(subject, issuer, not_before, not_after, sig, key, san, self_signed, sha256)."""
+    _t, s, e = der_tlv(der, 0)
+    _t, ts, te = der_tlv(der, s)                              # tbsCertificate
+    kids = der_children(der, ts, te)
+    i = 1 if kids[0][0] == 0xA0 else 0                         # optional [0] version
+    alg_k = der_children(der, kids[i + 1][1], kids[i + 1][2])[0]
+    sig_oid = der_oid(der[alg_k[1]:alg_k[2]])
+    issuer_k, validity_k, subject_k, spki_k = kids[i + 2], kids[i + 3], kids[i + 4], kids[i + 5]
+    vk = der_children(der, validity_k[1], validity_k[2])
+    nb = der_time(vk[0][0], der[vk[0][1]:vk[0][2]])
+    na = der_time(vk[1][0], der[vk[1][1]:vk[1][2]])
+    key = "?"
+    sk = der_children(der, spki_k[1], spki_k[2])
+    alg = der_children(der, sk[0][1], sk[0][2])
+    alg_oid = der_oid(der[alg[0][1]:alg[0][2]])
+    if alg_oid == "1.2.840.113549.1.1.1":                      # RSA: size from the modulus
+        bits = der[sk[1][1] + 1:sk[1][2]]
+        _t, rs, re_ = der_tlv(bits, 0)
+        _t, ns, ne = der_tlv(bits, rs)
+        n = bits[ns:ne].lstrip(b"\x00")
+        key = "RSA %d" % (((len(n) - 1) * 8 + n[0].bit_length()) if n else 0)
+    elif alg_oid == "1.2.840.10045.2.1":
+        curve = der_oid(der[alg[1][1]:alg[1][2]]) if len(alg) > 1 else ""
+        key = "EC " + CURVES.get(curve, curve)
+    elif alg_oid == "1.3.101.112":
+        key = "Ed25519"
+    san = []
+    for k in kids[i + 6:]:
+        if k[0] == 0xA3:                                       # [3] extensions
+            for _t, xs, xe in der_children(der, *der_children(der, k[1], k[2])[0][1:]):
+                ek = der_children(der, xs, xe)
+                if der_oid(der[ek[0][1]:ek[0][2]]) == "2.5.29.17":
+                    ov = ek[-1]                                 # OCTET STRING wrapping GeneralNames
+                    for gt, gs, ge in der_children(der, *der_children(der, ov[1], ov[2])[0][1:]):
+                        if gt == 0x82:
+                            san.append(der[gs:ge].decode("ascii", "replace"))
+    return {"subject": der_name(der, subject_k[1], subject_k[2]), "issuer": der_name(der, issuer_k[1], issuer_k[2]),
+            "not_before": nb, "not_after": na, "sig": SIGALGS.get(sig_oid, sig_oid), "key": key, "san": san[:30],
+            "self_signed": der[issuer_k[1]:issuer_k[2]] == der[subject_k[1]:subject_k[2]],
+            "sha256": hashlib.sha256(der).hexdigest()}
+
+
+def host_matches(host, names):
+    """TLS-style hostname match with single-label wildcards."""
+    host = host.lower().rstrip(".")
+    for n in names:
+        n = n.lower().rstrip(".")
+        if n == host:
+            return True
+        if n.startswith("*.") and host.count(".") == n.count(".") and host.split(".", 1)[1] == n[2:]:
+            return True
+    return False
+
+
+# ---- link-layer discovery protocols
+
+def parse_lldp(d):
+    """LLDP TLVs -> dict(chassis, port, port_desc, name, desc, mgmt)."""
+    info, i = {}, 0
+    while i + 2 <= len(d):
+        h = struct.unpack("!H", d[i:i + 2])[0]
+        t, ln = h >> 9, h & 0x1FF
+        v = d[i + 2:i + 2 + ln]
+        i += 2 + ln
+        if t == 0:
+            break
+        if t in (1, 2) and v:
+            sub, val = v[0], v[1:]
+            txt = mac_str(val) if sub == 4 and len(val) == 6 else printable(val, 60)
+            info["chassis" if t == 1 else "port"] = txt
+        elif t == 4:
+            info["port_desc"] = printable(v, 60)
+        elif t == 5:
+            info["name"] = printable(v, 60)
+        elif t == 6:
+            info["desc"] = printable(v.split(b"\n")[0], 80)
+        elif t == 8 and len(v) >= 6 and v[1] == 1:
+            info["mgmt"] = ip4(v[2:6])
+    return info
+
+
+def parse_cdp(d):
+    """CDP TLVs (after the 4-byte header) -> dict(name, port, platform, version, mgmt, duplex)."""
+    info, i = {}, 4
+    while i + 4 <= len(d):
+        t, ln = struct.unpack("!HH", d[i:i + 4])
+        if ln < 4:
+            break
+        v = d[i + 4:i + ln]
+        i += ln
+        if t == 1:
+            info["name"] = printable(v, 60)
+        elif t == 3:
+            info["port"] = printable(v, 60)
+        elif t == 6:
+            info["platform"] = printable(v, 60)
+        elif t == 5:
+            info["desc"] = printable(v.split(b"\n")[0], 80)
+        elif t == 0x0B and v:
+            info["duplex"] = "full" if v[0] == 1 else "half"
+        elif t == 2 and len(v) >= 4:
+            try:                                          # first IPv4 address, NLPID encoded
+                if v[4] == 1 and v[5] == 1 and v[6] == 0xCC and struct.unpack("!H", v[7:9])[0] == 4:
+                    info["mgmt"] = ip4(v[9:13])
+            except (IndexError, struct.error):
+                pass
+    return info
+
+
+def parse_stp(d):
+    """BPDU (after LLC) -> dict(type, root, bridge, tc) or None."""
+    if len(d) < 4:
+        return None
+    btype = d[3]
+    if btype == 0x80:
+        return {"type": "TCN", "tc": True}
+    if btype in (0x00, 0x02) and len(d) >= 35:
+        flags = d[4]
+        rp, rm = struct.unpack("!H", d[5:7])[0], mac_str(d[7:13])
+        bp, bm = struct.unpack("!H", d[17:19])[0], mac_str(d[19:25])
+        return {"type": "RSTP" if btype == 2 else "STP", "tc": bool(flags & 0x01),
+                "root": "%d / %s" % (rp & 0xF000, rm), "bridge": "%d / %s" % (bp & 0xF000, bm),
+                "root_cost": struct.unpack("!I", d[13:17])[0]}
+    return None
+
+
+# ---- quick header parser (filters, extraction and the flow-trace second pass)
+
+Quick = namedtuple("Quick", "src dst proto sport dport tcp")
+
+
+def quick_parse(link, data):
+    """Fast L2-L4 parse -> Quick(src, dst, proto, sport, dport, tcp) or None.
+    proto is 'tcp', 'udp', 'icmp', 'icmpv6', 'arp' or 'ipN'; tcp = (seq, ack, flags, win, payload_len) for TCP."""
+    try:
+        et, off = None, 0
+        if link == 1:
+            if len(data) < 14:
+                return None
+            et, off = struct.unpack("!H", data[12:14])[0], 14
+            while et in (0x8100, 0x88A8, 0x9100) and len(data) >= off + 4:
+                et = struct.unpack("!H", data[off + 2:off + 4])[0]
+                off += 4
+        elif link == 113:
+            et, off = struct.unpack("!H", data[14:16])[0], 16
+        elif link == 276:
+            et, off = struct.unpack("!H", data[0:2])[0], 20
+        elif link == 0:
+            et, off = (0x0800 if (data[4] >> 4) == 4 else 0x86DD), 4
+        elif link in (101, 228, 229):
+            et, off = (0x0800 if (data[0] >> 4) == 4 else 0x86DD), 0
+        if et == 0x0806 and len(data) >= off + 28:
+            return Quick(ip4(data[off + 14:off + 18]), ip4(data[off + 24:off + 28]), "arp", 0, 0, None)
+        if et == 0x0800:
+            d = data[off:]
+            ihl = (d[0] & 0x0F) * 4
+            proto, src, dst = d[9], ip4(d[12:16]), ip4(d[16:20])
+            totlen = struct.unpack("!H", d[2:4])[0]
+            ff = struct.unpack("!H", d[6:8])[0]
+            l4 = d[ihl:totlen if 20 <= totlen <= len(d) else len(d)]
+            if ff & 0x1FFF:
+                return Quick(src, dst, "ip%d" % proto, 0, 0, None)
+        elif et == 0x86DD:
+            d = data[off:]
+            plen, proto = struct.unpack("!HB", d[4:7])
+            src, dst = ip6(d[8:24]), ip6(d[24:40])
+            p = 40
+            while proto in (0, 43, 60, 44, 51) and len(d) >= p + 8:
+                nxt = d[p]
+                p += 8 if proto == 44 else (d[p + 1] + 1) * 8 if proto != 51 else (d[p + 1] + 2) * 4
+                proto = nxt
+            l4 = d[p:40 + plen if plen else len(d)]
+        else:
+            return None
+        if proto == 6 and len(l4) >= 20:
+            sp, dp, seq, ack, of, fl, win = struct.unpack("!HHIIBBH", l4[:16])
+            return Quick(src, dst, "tcp", sp, dp, (seq, ack, fl, win, max(0, len(l4) - (of >> 4) * 4)))
+        if proto == 17 and len(l4) >= 4:
+            sp, dp = struct.unpack("!HH", l4[:4])
+            return Quick(src, dst, "udp", sp, dp, None)
+        return Quick(src, dst, {1: "icmp", 58: "icmpv6"}.get(proto, "ip%d" % proto), 0, 0, None)
+    except (struct.error, IndexError, ValueError):
+        return None
+
+
+class PacketFilter:
+    """--host / --port / --proto / --flow / --from / --to selection applied while reading."""
+
+    def __init__(self, hosts=(), ports=(), protos=(), flows=(), t_from=None, t_to=None):
+        self.hosts, self.ports = set(hosts), set(ports)
+        self.protos = {p.lower() for p in protos}
+        self.flows = list(flows)
+        self.t_from, self.t_to = t_from, t_to
+        self.t0 = None
+
+    @property
+    def active(self):
+        return bool(self.hosts or self.ports or self.protos or self.flows or self.t_from or self.t_to)
+
+    @property
+    def l3l4(self):
+        return bool(self.hosts or self.ports or self.protos or self.flows)
+
+    @staticmethod
+    def parse_time(spec, t0):
+        """'+12.5' (seconds after the first packet), 'HH:MM:SS' or 'YYYY-MM-DD HH:MM:SS' (UTC) -> epoch."""
+        if spec is None:
+            return None
+        s = spec.strip()
+        if s.startswith("+"):
+            return ("rel", float(s[1:]))
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%H:%M:%S"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return ("abs", dt, fmt == "%H:%M:%S")
+            except ValueError:
+                continue
+        raise ValueError("bad time '%s' (use +SECONDS, HH:MM:SS or 'YYYY-MM-DD HH:MM:SS' in UTC)" % spec)
+
+    def _resolve(self, spec, ts):
+        if spec is None:
+            return None
+        if spec[0] == "rel":
+            return self.t0 + spec[1]
+        dt, tonly = spec[1], spec[2]
+        if tonly:
+            base = datetime.fromtimestamp(self.t0, timezone.utc)
+            dt = dt.replace(year=base.year, month=base.month, day=base.day)
+        return dt.replace(tzinfo=timezone.utc).timestamp()
+
+    def match(self, ts, link, data):
+        if ts is not None:
+            if self.t0 is None:
+                self.t0 = ts
+            lo, hi = self._resolve(self.t_from, ts), self._resolve(self.t_to, ts)
+            if (lo is not None and ts < lo) or (hi is not None and ts > hi):
+                return False
+        if not self.l3l4:
+            return True
+        q = quick_parse(link, data)
+        if q is None:
+            return False
+        if self.protos and q.proto not in self.protos:
+            return False
+        if self.hosts and q.src not in self.hosts and q.dst not in self.hosts:
+            return False
+        if self.ports and q.sport not in self.ports and q.dport not in self.ports:
+            return False
+        if self.flows:
+            a, b = (q.src, q.sport), (q.dst, q.dport)
+            if not any((a, b) == f or (b, a) == f for f in self.flows):
+                return False
+        return True
+
+    def describe(self):
+        bits = []
+        if self.hosts:
+            bits.append("host " + ",".join(sorted(self.hosts)))
+        if self.ports:
+            bits.append("port " + ",".join(str(p) for p in sorted(self.ports)))
+        if self.protos:
+            bits.append("proto " + ",".join(sorted(self.protos)))
+        if self.flows:
+            bits.append("flow " + "; ".join("%s:%d-%s:%d" % (a[0], a[1], b[0], b[1]) for a, b in self.flows))
+        if self.t_from or self.t_to:
+            bits.append("time window")
+        return ", ".join(bits)
+
+
+class PcapWriter:
+    """Classic little-endian microsecond pcap writer for --extract."""
+
+    def __init__(self, path, linktype, snaplen=262144):
+        self.fh = open(path, "wb")
+        self.link = linktype
+        self.n = self.skipped = 0
+        self.fh.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, snaplen, linktype))
+
+    def write(self, ts, caplen, origlen, link, data):
+        if link != self.link:
+            self.skipped += 1
+            return
+        ts = ts or 0.0
+        sec = int(ts)
+        self.fh.write(struct.pack("<IIII", sec, int((ts - sec) * 1e6), caplen, origlen) + data)
+        self.n += 1
+
+    def close(self):
+        self.fh.close()
+
+
 # ------------------------------------------------------------------ analyzer
+
+UNREACH_CODES = {0: "net", 1: "host", 2: "protocol", 3: "port", 4: "fragmentation needed", 5: "source route failed",
+                 9: "net admin prohibited", 10: "host admin prohibited", 13: "admin filtered"}
+
 
 class Analyzer:
     def __init__(self):
@@ -313,12 +928,11 @@ class Analyzer:
         self.tcp_dport, self.udp_dport = Counter(), Counter()
         self.tcp_dport_b, self.udp_dport_b = Counter(), Counter()
         self.tcp_flags = Counter()
-        self.flows = {}                          # key -> [pkts, bytes, first, last, proto]
-        self.tcp_state = {}                      # key -> [syn, synack, rst, fin, established]
-        self.next_seq = {}
+        self.flows = {}                          # key -> [pkts, bytes, proto, first_ts]
+        self.tcp_flows = {}                      # key -> TcpFlow
         self.retrans = 0
         self.out_of_order = 0
-        self.seen_seq = set()
+        self.dupacks = 0
         self.tcp_payload_pkts = 0
         self.zero_win = 0
         self.rst = 0
@@ -350,11 +964,48 @@ class Analyzer:
         self.ip_http = defaultdict(Counter)      # server ip -> HTTP Host headers
         self.ip_dnsq = defaultdict(Counter)      # client ip -> DNS names it queried
         self.ssdp = Counter()
+        # evidence: packet numbers per finding key, current packet context
+        self.cur, self.cur_ts, self._smac = 0, None, None
+        self.ev, self.evn = defaultdict(list), Counter()
+        self._ports, self._fkey, self._seq, self._dkey = (0, 0), None, 0, None
+        # L2 extras
+        self.pkts_ps, self.bcast_ps, self.mcast_ps, self.arp_req_ps = Counter(), Counter(), Counter(), Counter()
+        self.neighbors = {}
+        self.stp_msgs, self.stp_roots, self.stp_bridges = Counter(), Counter(), set()
+        self.stp_tc, self.stp_last_root, self.stp_root_changes = 0, None, 0
+        self.arp_targets, self.arp_replied, self.arp_asked = defaultdict(set), set(), Counter()
+        self.arp_req_pkts, self.arp_probes = defaultdict(list), 0
+        self.ip_macs = defaultdict(set)
+        self.dhcp_xids, self.dhcp_servers, self.dhcp_nak = {}, Counter(), 0
+        # path / MTU
+        self.tcp_mss = {"client (SYN)": Counter(), "server (SYN/ACK)": Counter()}
+        self.tcp_ws = {"client (SYN)": Counter(), "server (SYN/ACK)": Counter()}
+        self.tcp_opts = Counter()
+        self.df = Counter()
+        self.icmp_err, self.pmtu = Counter(), []
+        # latency
+        self.dns_pending, self.dns_lat = {}, []
+        self.http_pending, self.http_tx = {}, []
+        self.tls_ch, self.tls_lat, self.tls_split = {}, [], 0
+        # TLS fingerprints / certificates, periodic connections
+        self.ja3, self.ja3_info = Counter(), {}
+        self.cert_buf, self.certs, self._cert_seen = {}, [], set()
+        self.conn_times = defaultdict(list)
         self.ntp = 0
 
     # ---- top level
-    def add(self, ts, caplen, origlen, link, data):
+    def mark(self, key):
+        """Remember the current packet number as evidence for a finding key."""
+        self.evn[key] += 1
+        lst = self.ev[key]
+        if len(lst) < 40 and (not lst or lst[-1] != self.cur):
+            lst.append(self.cur)
+
+    def add(self, ts, caplen, origlen, link, data, n=None):
         self.pkts += 1
+        self.cur = n if n is not None else self.pkts
+        self.cur_ts = ts
+        self._smac = None
         self.bytes += origlen
         self.cap_bytes += caplen
         if caplen < origlen:
@@ -365,6 +1016,7 @@ class Analyzer:
             if self.last_ts is None or ts > self.last_ts:
                 self.last_ts = ts
             self.per_second[int(ts)] += origlen
+            self.pkts_ps[int(ts)] += 1
         self.sizes.append(origlen)
         stack = ["link%d" % link]
         self._pair = None
@@ -416,12 +1068,19 @@ class Analyzer:
         dst, src = data[0:6], data[6:12]
         et = struct.unpack("!H", data[12:14])[0]
         stack[0] = "eth"
-        self.mac_pkts[mac_str(src)] += 1
-        self.mac_bytes[mac_str(src)] += origlen
+        smac = mac_str(src)
+        self._smac = smac
+        self.mac_pkts[smac] += 1
+        self.mac_bytes[smac] += origlen
+        sec = int(self.cur_ts) if self.cur_ts is not None else None
         if dst == b"\xff" * 6:
             self.cast["broadcast"] += 1
+            if sec is not None:
+                self.bcast_ps[sec] += 1
         elif dst[0] & 1:
             self.cast["multicast"] += 1
+            if sec is not None:
+                self.mcast_ps[sec] += 1
         else:
             self.cast["unicast"] += 1
         off = 14
@@ -430,13 +1089,47 @@ class Analyzer:
             self.vlans[tci & 0x0FFF] += 1
             stack.append("vlan")
             off += 4
-        if et <= 1500:                     # 802.3 length field (LLC): STP/CDP/etc.
+        if et <= 1500:                     # 802.3 length field: LLC (STP, CDP, ...)
             self.ethertype["802.3/LLC"] += 1
-            stack.append("llc")
+            self.decode_llc(src, data[off:off + et], stack)
             return
-        self.decode_ethertype(et, data[off:], origlen, stack)
+        self.decode_ethertype(et, data[off:], origlen, stack, src)
 
-    def decode_ethertype(self, et, payload, origlen, stack):
+    def decode_llc(self, src, p, stack):
+        if len(p) < 3:
+            stack.append("llc")
+        elif p[0] == 0x42 and p[1] == 0x42:
+            stack.append("stp")
+            b = parse_stp(p[3:])
+            if b:
+                self.stp_msgs[b["type"]] += 1
+                if b["tc"]:
+                    self.stp_tc += 1
+                    self.mark("stp-tc")
+                if "root" in b:
+                    self.stp_roots[b["root"]] += 1
+                    self.stp_bridges.add(b["bridge"])
+                    if self.stp_last_root and self.stp_last_root != b["root"]:
+                        self.stp_root_changes += 1
+                        self.mark("stp-root")
+                    self.stp_last_root = b["root"]
+        elif p[0] == 0xAA and p[1] == 0xAA and len(p) >= 8 and p[3:6] == b"\x00\x00\x0c" and p[6:8] == b"\x20\x00":
+            stack.append("cdp")
+            self.note_neighbor("CDP", mac_str(src), parse_cdp(p[8:]))
+        else:
+            stack.append("llc")
+
+    def note_neighbor(self, proto, mac, info):
+        if not info:
+            return
+        key = (proto, mac, info.get("name") or info.get("chassis") or "")
+        n = self.neighbors.get(key)
+        if n is None:
+            if len(self.neighbors) < 500:
+                self.neighbors[key] = dict(info, proto=proto, mac=mac, count=1, pkt=self.cur)
+        else:
+            n["count"] += 1
+    def decode_ethertype(self, et, payload, origlen, stack, src=None):
         self.ethertype[ETHERTYPES.get(et, "0x%04x" % et)] += 1
         if et == 0x0800:
             self.decode_ipv4(payload, origlen, stack)
@@ -444,9 +1137,11 @@ class Analyzer:
             self.decode_ipv6(payload, origlen, stack)
         elif et == 0x0806:
             self.decode_arp(payload, stack)
+        elif et == 0x88CC:
+            stack.append("lldp")
+            self.note_neighbor("LLDP", mac_str(src) if src else "?", parse_lldp(payload))
         else:
             stack.append(ETHERTYPES.get(et, "0x%04x" % et).lower())
-
     def decode_arp(self, d, stack):
         stack.append("arp")
         if len(d) < 28:
@@ -455,14 +1150,35 @@ class Analyzer:
         op = struct.unpack("!H", d[6:8])[0]
         self.arp_ops["request" if op == 1 else "reply" if op == 2 else "op%d" % op] += 1
         sha, spa, tpa = mac_str(d[8:14]), ip4(d[14:18]), ip4(d[24:28])
+        if op == 1:
+            if self.cur_ts is not None:
+                self.arp_req_ps[int(self.cur_ts)] += 1
+            if spa == "0.0.0.0":
+                self.arp_probes += 1
+            else:
+                tg = self.arp_targets[spa]
+                if len(tg) < 5000:
+                    tg.add(tpa)
+            self.arp_asked[tpa] += 1
+            lst = self.arp_req_pkts[tpa]
+            if len(lst) < 10:
+                lst.append(self.cur)
+        elif op == 2:
+            self.arp_replied.add(spa)
         if spa != "0.0.0.0":
             self.arp_map[spa].add(sha)
+            if len(self.arp_map[spa]) > 1:
+                self.mark("arpconf:" + spa)
         if spa == tpa:
             self.arp_gratuitous += 1
-
+            self.mark("arp-gratuitous")
     # ---- L3
     def count_ip(self, src, dst, length, ver, stack):
         self._pair = (src, dst)
+        if self._smac is not None:
+            m = self.ip_macs[src]
+            if self._smac not in m and len(m) < 8:
+                m.add(self._smac)
         self.ip_ver[ver] += 1
         self.ip_tx_p[src] += 1
         self.ip_tx_b[src] += length
@@ -486,8 +1202,10 @@ class Analyzer:
         self.dscp[tos >> 2] += 1
         end = totlen if 20 <= totlen <= len(d) else len(d)
         payload = d[ihl:end]
+        self.df["DF set" if ff & 0x4000 else "DF clear"] += 1
         if (ff & 0x1FFF) != 0 or (ff & 0x2000):
             self.frags += 1
+            self.mark("frag")
             if ff & 0x1FFF:
                 stack.append("ip-frag")
                 return
@@ -526,22 +1244,55 @@ class Analyzer:
             self.icmp["%s (type %d code %d)" % (ICMP_TYPES.get(p[0], "other"), p[0], p[1])] += 1
             if p[0] == 3 and p[1] == 3:
                 self.udp_port_unreach += 1
+                self.mark("icmp-unreach")
+            if p[0] in (3, 5, 11, 12) and len(p) >= 28:
+                self.note_icmp_error(src, p[0], p[1], p, False)
         elif proto == 58 and len(p) >= 2:
             stack.append("icmpv6")
             self.l4["ICMPv6"] += 1
             self.icmp["%s (type %d)" % (ICMP6_TYPES.get(p[0], "other"), p[0])] += 1
+            if p[0] in (1, 2, 3, 4) and len(p) >= 48:
+                self.note_icmp_error(src, p[0], p[1], p, True)
         else:
             name = IPPROTOS.get(proto, "proto %d" % proto)
             stack.append(name.lower())
             self.l4[name] += 1
 
-    def flow_update(self, key, origlen, ts_unused, proto):
+    def note_icmp_error(self, reporter, t, c, p, v6):
+        """ICMP error carrying the start of the offending packet: who complained about what."""
+        if v6:
+            inner = p[8:]
+            if inner[0] >> 4 != 6:
+                return
+            orig_dst = ip6(inner[24:40])
+            kind = ICMP6_TYPES.get(t, "error type %d" % t)
+            if t == 2:
+                self.pmtu.append((reporter, struct.unpack("!I", p[4:8])[0], ip6(inner[8:24]), orig_dst, self.cur))
+                self.mark("pmtu")
+        else:
+            inner = p[8:]
+            if inner[0] >> 4 != 4:
+                return
+            orig_dst = ip4(inner[16:20])
+            kind = ICMP_TYPES.get(t, "type %d" % t)
+            if t == 3:
+                kind += "/" + UNREACH_CODES.get(c, "code %d" % c)
+            if t == 3 and c == 4:
+                self.pmtu.append((reporter, struct.unpack("!H", p[6:8])[0], ip4(inner[12:16]), orig_dst, self.cur))
+                self.mark("pmtu")
+        if len(self.icmp_err) < 2000:
+            self.icmp_err[(reporter, kind, orig_dst)] += 1
+    def flow_update(self, key, origlen, ts, proto, src_ep):
         f = self.flows.get(key)
         if f is None:
-            f = self.flows[key] = [0, 0, proto]
+            f = self.flows[key] = [0, 0, proto, ts]
+            if proto == "udp" and ts is not None:           # first packet of a UDP flow = a "connection" for periodicity
+                server = key[0] if key[1] == src_ep else key[1]
+                lst = self.conn_times[(src_ep[0], server[0], server[1], "udp")]
+                if len(lst) < 400 and len(self.conn_times) < 100000:
+                    lst.append(ts)
         f[0] += 1
         f[1] += origlen
-
     def decode_tcp(self, src, dst, p, origlen, stack):
         stack.append("tcp")
         self.l4["TCP"] += 1
@@ -550,52 +1301,66 @@ class Analyzer:
             return
         sport, dport, seq, ack, off_f, flags, win = struct.unpack("!HHIIBBH", p[:16])
         hl = (off_f >> 4) * 4
+        syn, ackf = flags & 0x02, flags & 0x10
+        opts = parse_tcp_options(p[20:hl]) if hl > 20 and syn else None
         payload = p[hl:]
         self.tcp_flags[flags_str(flags)] += 1
         a, b = (src, sport), (dst, dport)
         key = (a, b) if a <= b else (b, a)
-        self.flow_update(key, origlen, None, "tcp")
-        st = self.tcp_state.get(key)
-        if st is None:
-            st = self.tcp_state[key] = [0, 0, 0, 0, 0]
-        syn, ackf = flags & 0x02, flags & 0x10
+        self.flow_update(key, origlen, self.cur_ts, "tcp", a)
+        fl = self.tcp_flows.get(key)
+        if fl is None:
+            client, server = (b, a) if (syn and ackf) else (a, b)
+            fl = self.tcp_flows[key] = TcpFlow(client, server, len(self.tcp_flows))
+        d = fl.direction(src, sport)
         if syn and not ackf:
-            st[0] += 1
             self.syn_targets[src].add((dst, dport))
+            self.mark("scan:" + src)
             self.tcp_dport[dport] += 1
             self.ip_services[dst]["%d/tcp" % dport] += 1
             self.tcp_dport_b[dport] += origlen
+            if self.cur_ts is not None and len(self.conn_times) < 100000:
+                lst = self.conn_times[(src, dst, dport, "tcp")]
+                if len(lst) < 400:
+                    lst.append(self.cur_ts)
         elif syn and ackf:
-            st[1] += 1
             self.answered.add((dst, src, sport))
-        if flags & 0x04:
-            st[2] += 1
-            self.rst += 1
-        if flags & 0x01:
-            st[3] += 1
-        if st[0] and st[1] and ackf and not syn:
-            st[4] = 1
-        if win == 0 and not (flags & 0x04) and not syn:
-            self.zero_win += 1
-        # retransmission heuristic: payload (or SYN/FIN) re-sent below the highest seq already seen
-        dkey = (src, sport, dst, dport)
-        seg = len(payload) + (1 if flags & 0x03 else 0)
-        if seg:
-            nxt = self.next_seq.get(dkey)
-            if nxt is not None and ((seq - nxt) & 0xFFFFFFFF) > 0x80000000:
-                if (dkey, seq) in self.seen_seq:
-                    self.retrans += 1          # same segment start seen before: real retransmission
-                else:
-                    self.out_of_order += 1     # fills a gap: reordered, not re-sent
-            elif len(self.seen_seq) < 2000000:
-                self.seen_seq.add((dkey, seq))
-            end = (seq + seg) & 0xFFFFFFFF
-            if nxt is None or ((end - nxt) & 0xFFFFFFFF) < 0x80000000:
-                self.next_seq[dkey] = end
+        marks = fl.update(self.cur_ts, self.cur, d, seq, ack, flags, win, len(payload), origlen, opts)
+        for m in marks:
+            if m == "retransmission":
+                self.retrans += 1
+                self.mark("retrans")
+            elif m == "out-of-order":
+                self.out_of_order += 1
+                self.mark("ooo")
+            elif m == "dup-ack":
+                self.dupacks += 1
+                self.mark("dupack")
+            elif m == "zero-window":
+                self.zero_win += 1
+                self.mark("zerowin")
+            elif m == "rst":
+                self.rst += 1
+                self.mark("rst")
+        if opts is not None:
+            side = "server (SYN/ACK)" if ackf else "client (SYN)"
+            if "mss" in opts:
+                self.tcp_mss[side][opts["mss"]] += 1
+            if "ws" in opts:
+                self.tcp_ws[side][opts["ws"]] += 1
+            if opts.get("sack"):
+                self.tcp_opts["SACK permitted (%s)" % side] += 1
+            if opts.get("ts"):
+                self.tcp_opts["timestamps (%s)" % side] += 1
+            if flags & 0xC0 and not ackf:
+                self.tcp_opts["ECN setup (client SYN)"] += 1
         if payload:
             self.tcp_payload_pkts += 1
+            self._ports, self._fkey, self._seq, self._dkey = (sport, dport), key, seq, (src, sport, dst, dport)
+            if self._dkey in self.cert_buf and self.cert_feed(self._dkey, seq, payload):
+                stack.append("tls")                      # continuation of the server's TLS handshake flight
+                return
             self.decode_tcp_payload(src, dst, sport, dport, payload, origlen, stack)
-
     def decode_udp(self, src, dst, p, origlen, stack):
         stack.append("udp")
         self.l4["UDP"] += 1
@@ -605,15 +1370,15 @@ class Analyzer:
         sport, dport, ulen = struct.unpack("!HHH", p[:6])
         a, b = (src, sport), (dst, dport)
         key = (a, b) if a <= b else (b, a)
-        self.flow_update(key, origlen, None, "udp")
+        self.flow_update(key, origlen, self.cur_ts, "udp", a)
         self.udp_dport[dport] += 1
         if dport in SERVICES or dport < 1024:
             self.ip_services[dst]["%d/udp" % dport] += 1
         self.udp_dport_b[dport] += origlen
         payload = p[8:]
         if payload:
+            self._ports = (sport, dport)
             self.decode_udp_payload(src, dst, sport, dport, payload, stack)
-
     # ---- L5-L7 over TCP
     def decode_tcp_payload(self, src, dst, sport, dport, d, origlen, stack):
         if d[0] == 0x16 and len(d) > 5 and d[1] == 3 and d[2] <= 4:
@@ -641,12 +1406,14 @@ class Analyzer:
             up = text.upper()
             if up.startswith((b"USER ", b"PASS ")):
                 self.cleartext["FTP login"] += 1
+                self.mark("clear:FTP login")
                 self.cleartext_hosts["FTP login"].add(src if dport == 21 else dst)
             elif text[:3].isdigit():
                 self.banners["FTP: " + printable(text.split(b"\r")[0], 60)] += 1
         elif name == "telnet":
             stack.append("telnet")
             self.cleartext["Telnet session"] += 1
+            self.mark("clear:Telnet session")
             self.cleartext_hosts["Telnet session"].add(dst if dport == 23 else src)
         elif name in ("smtp", "submission"):
             stack.append("smtp")
@@ -654,12 +1421,14 @@ class Analyzer:
                 self.banners["SMTP: " + printable(text.split(b"\r")[0], 60)] += 1
             if text.upper().startswith((b"AUTH PLAIN", b"AUTH LOGIN")):
                 self.cleartext["SMTP AUTH"] += 1
+                self.mark("clear:SMTP AUTH")
                 self.cleartext_hosts["SMTP AUTH"].add(dst)
         elif name in ("pop3", "imap"):
             stack.append(name)
             up = text.upper()
             if b"USER " in up[:12] or b"PASS " in up[:12] or b" LOGIN " in up[:30]:
                 self.cleartext[name.upper() + " login"] += 1
+                self.mark("clear:" + name.upper() + " login")
                 self.cleartext_hosts[name.upper() + " login"].add(dst if dport in (110, 143) else src)
         elif name == "smb":
             stack.append("smb")
@@ -677,23 +1446,25 @@ class Analyzer:
         if hs not in (1, 2):
             self.tls_records["handshake (other)"] += 1
             return
+        try:
+            self.parse_hello(src, dst, d, hs)
+        except (IndexError, struct.error):
+            self.tls_split += 1                    # hello spans several segments; not reassembled
+
+    def parse_hello(self, src, dst, d, hs):
         body = d[9:]
-        ver = struct.unpack("!H", body[0:2])[0]
+        ver = ch_ver = struct.unpack("!H", body[0:2])[0]
         off = 34                                   # version + random
-        sid = body[off]
-        off += 1 + sid
-        sel = None
+        off += 1 + body[off]                       # session id
         sni = None
+        ciphers, ext_types, curves, pformats = [], [], [], []
         if hs == 1:
-            self.tls_clienthello += 1
             cs = struct.unpack("!H", body[off:off + 2])[0]
+            ciphers = [struct.unpack("!H", body[off + 2 + i:off + 4 + i])[0] for i in range(0, cs - 1, 2)]
             off += 2 + cs
             off += 1 + body[off]                   # compression methods
-            vers = []
         else:
-            self.tls_serverhello += 1
             sel = struct.unpack("!H", body[off:off + 2])[0]
-            self.tls_ciphers["0x%04x" % sel] += 1
             off += 3                               # cipher + compression
         if off + 2 <= len(body):
             elen = struct.unpack("!H", body[off:off + 2])[0]
@@ -703,6 +1474,7 @@ class Analyzer:
                 et, el = struct.unpack("!HH", body[off:off + 4])
                 ed = body[off + 4:off + 4 + el]
                 off += 4 + el
+                ext_types.append(et)
                 if et == 0 and hs == 1 and len(ed) >= 5:
                     sni = ed[5:5 + struct.unpack("!H", ed[3:5])[0]].decode("latin-1")
                 elif et == 0x10 and hs == 1 and len(ed) >= 3:
@@ -711,6 +1483,10 @@ class Analyzer:
                         n = ed[i]
                         self.tls_alpn[ed[i + 1:i + 1 + n].decode("latin-1")] += 1
                         i += 1 + n
+                elif et == 0x0A and hs == 1 and len(ed) >= 2:
+                    curves = [struct.unpack("!H", ed[i:i + 2])[0] for i in range(2, len(ed) - 1, 2)]
+                elif et == 0x0B and hs == 1 and ed:
+                    pformats = list(ed[1:])
                 elif et == 0x2B:
                     if hs == 1 and ed:
                         vers = [struct.unpack("!H", ed[i:i + 2])[0] for i in range(1, len(ed) - 1, 2)]
@@ -720,13 +1496,108 @@ class Analyzer:
                     elif hs == 2 and len(ed) >= 2:
                         ver = struct.unpack("!H", ed[:2])[0]
         label = TLS_VERSIONS.get(ver, "0x%04x" % ver)
+        if hs == 1:
+            self.tls_clienthello += 1
+            g = lambda xs: [str(x) for x in xs if x not in GREASE]
+            ja3s = "%d,%s,%s,%s,%s" % (ch_ver, "-".join(g(ciphers)), "-".join(g(ext_types)), "-".join(g(curves)),
+                                       "-".join(str(x) for x in pformats))
+            try:
+                h = hashlib.md5(ja3s.encode(), usedforsecurity=False).hexdigest()
+            except TypeError:
+                h = hashlib.md5(ja3s.encode()).hexdigest()
+            self.ja3[h] += 1
+            info = self.ja3_info.setdefault(h, {"string": ja3s, "sni": Counter(), "clients": set(), "pkt": self.cur})
+            if sni:
+                info["sni"][sni] += 1
+            if len(info["clients"]) < 50:
+                info["clients"].add(src)
+            if self.cur_ts is not None and len(self.tls_ch) < 100000:
+                self.tls_ch[self._fkey] = (self.cur_ts, sni, self.cur)
+            fl = self.tcp_flows.get(self._fkey)
+            if fl is not None and sni:
+                fl.sni = sni
+        else:
+            self.tls_serverhello += 1
+            self.tls_ciphers["0x%04x" % sel] += 1
+            ch = self.tls_ch.pop(self._fkey, None)
+            if ch is not None and self.cur_ts is not None and len(self.tls_lat) < 200000:
+                self.tls_lat.append(((self.cur_ts - ch[0]) * 1000.0, ch[1] or "", src, label, ch[2], self.cur))
+            if ver != 0x0304 and self._dkey not in self.cert_buf and len(self.cert_buf) < 20000:
+                self.cert_buf[self._dkey] = {"base": self._seq, "segs": {0: d}, "bytes": len(d), "done": False}
+                self.cert_try(self._dkey)
         self.tls_hello_versions[("ClientHello offers up to " if hs == 1 else "ServerHello selects ") + label] += 1
         if label in ("SSLv3", "TLS 1.0", "TLS 1.1"):
             self.tls_old[("client offers at most " if hs == 1 else "server selected ") + label] += 1
+            self.mark("tls-old")
         if sni:
             self.tls_sni[sni] += 1
             self.ip_sni[dst][sni] += 1
 
+    def cert_feed(self, dkey, seq, payload):
+        """Collect the server's TLS flight (TLS <= 1.2) across segments. True while the data is consumed."""
+        cb = self.cert_buf[dkey]
+        if cb["done"]:
+            return False
+        off = (seq - cb["base"]) & MASK32
+        if off >= 65536 or cb["bytes"] + len(payload) > 40000:
+            cb["done"] = True
+            return False
+        if off not in cb["segs"]:
+            cb["segs"][off] = payload
+            cb["bytes"] += len(payload)
+            self.cert_try(dkey)
+        return True
+
+    def cert_try(self, dkey):
+        cb = self.cert_buf[dkey]
+        buf = b""
+        for off in sorted(cb["segs"]):                 # contiguous prefix only
+            seg = cb["segs"][off]
+            if off > len(buf):
+                break
+            buf += seg[len(buf) - off:]
+        pos, hs = 0, b""
+        while pos + 5 <= len(buf):
+            if buf[pos] != 0x16:                       # ChangeCipherSpec / data: handshake flight is over
+                cb["done"] = True
+                return
+            rlen = struct.unpack("!H", buf[pos + 3:pos + 5])[0]
+            if pos + 5 + rlen > len(buf):
+                break
+            hs += buf[pos + 5:pos + 5 + rlen]
+            pos += 5 + rlen
+        p = 0
+        while p + 4 <= len(hs):
+            mtype, mlen = hs[p], int.from_bytes(hs[p + 1:p + 4], "big")
+            if p + 4 + mlen > len(hs):
+                return                                  # message not complete yet
+            if mtype == 11 and mlen >= 6:
+                cb["done"] = True
+                chain = hs[p + 4 + 3:p + 4 + mlen]
+                if len(chain) >= 3:
+                    clen = int.from_bytes(chain[0:3], "big")
+                    der = chain[3:3 + clen]
+                    try:
+                        info = parse_certificate(der)
+                    except (ValueError, IndexError, struct.error):
+                        return
+                    if info["sha256"] not in self._cert_seen:
+                        self._cert_seen.add(info["sha256"])
+                        fl = self.tcp_flows.get(self._fkey)
+                        info.update(server=(dkey[0], dkey[1]), sni=fl.sni if fl else "", pkt=self.cur, servers=1)
+                        self.certs.append(info)
+                    else:
+                        fl = self.tcp_flows.get(self._fkey)
+                        for c in self.certs:
+                            if c["sha256"] == info["sha256"]:
+                                c["servers"] += 1
+                                if not c["sni"] and fl is not None and fl.sni:
+                                    c["sni"] = fl.sni
+                return
+            if mtype == 14:                              # ServerHelloDone without a Certificate (resumed session)
+                cb["done"] = True
+                return
+            p += 4 + mlen
     def decode_http(self, src, dst, d, stack):
         stack.append("http")
         head = d.split(b"\r\n\r\n", 1)[0].split(b"\r\n")
@@ -737,17 +1608,28 @@ class Analyzer:
             hdrs[k.strip().lower()] = v.strip()
         if first.startswith(b"HTTP/"):
             parts = first.split(b" ", 2)
-            if len(parts) >= 2 and parts[1].isdigit():
-                self.http_status[parts[1].decode()] += 1
+            code = parts[1].decode() if len(parts) >= 2 and parts[1].isdigit() else ""
+            if code:
+                self.http_status[code] += 1
             if b"server" in hdrs:
                 self.http_server[printable(hdrs[b"server"], 60)] += 1
             if b"content-type" in hdrs:
                 self.http_ctype[printable(hdrs[b"content-type"].split(b";")[0], 40)] += 1
+            q = self.http_pending.get(self._fkey)
+            if q and self.cur_ts is not None and len(self.http_tx) < 200000:
+                t0, host, path, pk = q.popleft()
+                self.http_tx.append(((self.cur_ts - t0) * 1000.0, host, path, code, src, pk, self.cur))
         else:
-            self.http_methods[first.split(b" ")[0].decode("latin-1")] += 1
+            parts = first.split(b" ")
+            self.http_methods[parts[0].decode("latin-1")] += 1
+            host = printable(hdrs.get(b"host", b""), 60)
             if b"host" in hdrs:
-                self.http_hosts[printable(hdrs[b"host"], 60)] += 1
-                self.ip_http[dst][printable(hdrs[b"host"], 60)] += 1
+                self.http_hosts[host] += 1
+                self.ip_http[dst][host] += 1
+            if self.cur_ts is not None and len(self.http_pending) < 100000:
+                q = self.http_pending.setdefault(self._fkey, deque())
+                if len(q) < 16:
+                    q.append((self.cur_ts, host or dst, printable(parts[1], 80) if len(parts) > 1 else "", self.cur))
             if b"user-agent" in hdrs:
                 self.http_ua[printable(hdrs[b"user-agent"], 70)] += 1
             if b"authorization" in hdrs:
@@ -755,17 +1637,18 @@ class Analyzer:
                 if hdrs[b"authorization"].lower().startswith(b"basic"):
                     self.cleartext["HTTP Basic auth"] += 1
                     self.cleartext_hosts["HTTP Basic auth"].add(dst)
+                    self.mark("clear:HTTP Basic auth")
             if first.startswith(b"POST ") and (b"password" in d.lower() or b"passwd" in d.lower()):
                 self.cleartext["HTTP POST with password field"] += 1
                 self.cleartext_hosts["HTTP POST with password field"].add(dst)
-
+                self.mark("clear:HTTP POST with password field")
     # ---- L5-L7 over UDP
     def decode_udp_payload(self, src, dst, sport, dport, d, stack):
         ports = (sport, dport)
         if 53 in ports or 5353 in ports or 5355 in ports:
             self.decode_dns(src, dst, d, stack, mdns=(5353 in ports))
         elif 67 in ports or 68 in ports:
-            self.decode_dhcp(d, stack)
+            self.decode_dhcp(src, d, stack)
         elif 123 in ports and len(d) >= 48:
             stack.append("ntp")
             self.ntp += 1
@@ -802,7 +1685,7 @@ class Analyzer:
         qr = fl >> 15
         rcode = fl & 0xF
         off = 12
-        qname = None
+        qname, qtype = None, None
         for _ in range(min(qd, 1)):
             qname, off = read_dns_name(d, off)
             if off + 4 > len(d):
@@ -816,9 +1699,17 @@ class Analyzer:
                     self.dns_qtype[DNS_TYPES.get(qtype, str(qtype))] += 1
                     if len(qname) > 60 or max((len(x) for x in qname.split(".")), default=0) > 40:
                         self.dns_long.append(qname)
+                        self.mark("dns-long")
+        sp, dp = self._ports
         if qr:
             self.dns_responses += 1
             self.dns_rcode[DNS_RCODES.get(rcode, "rcode %d" % rcode)] += 1
+            if rcode == 3:
+                self.mark("nxdomain")
+            pend = self.dns_pending.pop((dst, src, dp, sp, tid), None) if not mdns else None
+            if pend is not None and self.cur_ts is not None and len(self.dns_lat) < 200000:
+                self.dns_lat.append(((self.cur_ts - pend[0]) * 1000.0, pend[1] or "", src,
+                                     DNS_RCODES.get(rcode, "rcode %d" % rcode), pend[3], self.cur))
             for _ in range(min(an, 20)):           # learn IP -> name from answers
                 name, off = read_dns_name(d, off)
                 if off + 10 > len(d):
@@ -833,11 +1724,15 @@ class Analyzer:
                     self.dns_names.setdefault(ip6(rd), name.lower())
         else:
             self.dns_queries += 1
-
-    def decode_dhcp(self, d, stack):
+            if not mdns and self.cur_ts is not None and len(self.dns_pending) < 200000:
+                self.dns_pending.setdefault((src, dst, sp, dp, tid), (self.cur_ts, qname, qtype, self.cur, dst))
+    def decode_dhcp(self, src, d, stack):
         stack.append("dhcp")
         if len(d) < 240 or d[236:240] != b"\x63\x82\x53\x63":
             return
+        xid = struct.unpack("!I", d[4:8])[0]
+        mac = mac_str(d[28:34])
+        msg, server_id = None, None
         off = 240
         while off + 2 <= len(d):
             code = d[off]
@@ -849,12 +1744,27 @@ class Analyzer:
             ln = d[off + 1]
             val = d[off + 2:off + 2 + ln]
             if code == 53 and val:
+                msg = val[0]
                 self.dhcp_types[DHCP_TYPES.get(val[0], str(val[0]))] += 1
+            elif code == 54 and len(val) == 4:
+                server_id = ip4(val)
             elif code == 12:
                 self.dhcp_hosts[printable(val, 40)] += 1
             elif code == 60:
                 self.dhcp_vendor[printable(val, 40)] += 1
             off += 2 + ln
+        if msg is None:
+            return
+        x = self.dhcp_xids.get(xid)
+        if x is None and len(self.dhcp_xids) < 50000:
+            x = self.dhcp_xids[xid] = {"mac": mac, "types": set(), "pkt": self.cur}
+        if x is not None:
+            x["types"].add(msg)
+        if msg in (2, 5):                                    # OFFER / ACK come from a server
+            self.dhcp_servers[server_id or src] += 1
+        if msg == 6:
+            self.dhcp_nak += 1
+            self.mark("dhcp-nak")
 
 
 # ------------------------------------------------------------------ whois
@@ -894,6 +1804,13 @@ def cymru_whois(ips, chunk=400):
 # ------------------------------------------------------------------ report model
 
 SEVERITY = {"high": ("HIGH", "bgred", 0), "medium": ("MEDIUM", "bgyellow", 1), "info": ("INFO", "bgblue", 2)}
+
+
+def evidence_text(fd):
+    if not fd.pkts:
+        return ""
+    more = fd.total - len(fd.pkts)
+    return "packets " + ", ".join(str(p) for p in fd.pkts) + (" (+%d more)" % more if more > 0 else "")
 
 
 class Style:
@@ -947,12 +1864,12 @@ def bin_series(per_second, n):
     return bins, lo, hi + 1, span / n
 
 
-_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4, "ms": 1, "s": 1000}
 
 
 def sort_key(cell):
     """Numeric value of a table cell ('1,234', '12.5%', '1.4 MB') or None."""
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*(%|[KMGT]?B)?", cell.replace(",", "").strip())
+    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*(%|[KMGT]?B|ms|s)?", cell.replace(",", "").strip())
     if not m:
         return None
     return float(m.group(1)) * _UNITS.get(m.group(2), 1)
@@ -1007,7 +1924,7 @@ class Report:
 
     @staticmethod
     def findings(sec, items):
-        sec["items"].append({"t": "findings", "items": sorted(items, key=lambda x: SEVERITY[x[0]][2])})
+        sec["items"].append({"t": "findings", "items": sorted(items, key=lambda x: SEVERITY[x.sev][2])})
 
     @staticmethod
     def timeline(sec, per_second):
@@ -1018,6 +1935,11 @@ class Report:
     def donut(sec, title, pairs):
         if pairs:
             sec["items"].append({"t": "donut", "title": title, "pairs": pairs})
+
+    @staticmethod
+    def flowtraces(sec, traces):
+        if traces:
+            sec["items"].append({"t": "flowtraces", "traces": traces})
 
     @staticmethod
     def hosts(sec, hosts):
@@ -1058,6 +1980,9 @@ class Report:
                     out += self._graph_text(st, it, width)
                 elif t == "hosts":
                     out += self._hosts_text(st, it["hosts"], width)
+                elif t == "flowtraces":
+                    for tr in it["traces"][:3]:
+                        out += self._trace_text(st, tr, width)
         return "\n".join(out).lstrip("\n") + "\n"
 
     @staticmethod
@@ -1067,9 +1992,15 @@ class Report:
         cols = list(zip(*([headers] + rows)))
         widths = [min(max(len(c) for c in col), 58) for col in cols]
         budget = width - 6 - (14 if bi is not None else 0) - 2 * (len(widths) - 1)
-        while sum(widths) > budget and max(widths) > 16:
-            widths[widths.index(max(widths))] -= 1
         right = [all(_numlike(r[i]) for r in rows) for i in range(len(headers))]
+        fixed = [right[i] or all(re.fullmatch(r"\[?[0-9a-fA-F:.]+\]?(:\d+)?", r[i]) for r in rows) for i in range(len(headers))]
+        for floor, only_flex in ((12, True), (16, False)):
+            while sum(widths) > budget:
+                cand = [i for i in range(len(widths)) if widths[i] > floor and (not only_flex or not fixed[i])]
+                if not cand:
+                    break
+                i = max(cand, key=lambda k: widths[k])
+                widths[i] -= 1
 
         def cell(i, c):
             if len(c) > widths[i]:
@@ -1105,11 +2036,17 @@ class Report:
         out = [""]
         if not items:
             return out + ["  " + st("green", "✔ ") + "Nothing notable found by the built-in checks."]
-        for sev, text in items:
-            label, style, _ = SEVERITY[sev]
-            lines = textwrap.wrap(text, max(30, width - 14)) or [""]
+        for fd in items:
+            label, style, _ = SEVERITY[fd.sev]
+            lines = textwrap.wrap(fd.text, max(30, width - 14)) or [""]
             out.append("  " + st(style, " %-6s " % label) + " " + lines[0])
             out += ["  " + " " * 9 + " " + l for l in lines[1:]]
+            ev = evidence_text(fd)
+            if ev:
+                out.append("  " + " " * 9 + " " + st("dim", "↳ " + ev))
+            if fd.filt:
+                for i, l in enumerate(textwrap.wrap(fd.filt, max(30, width - 24)) or [""]):
+                    out.append("  " + " " * 9 + " " + st("dim", "↳ filter: " if i == 0 else "          ") + st("cyan", l))
         return out
 
     @staticmethod
@@ -1125,6 +2062,25 @@ class Report:
         out.append("    " + " " * 10 + st("dim", " └" + "─" * n))
         a, b = fmt_ts(lo)[11:19], fmt_ts(hi)[11:19]
         out.append("    " + " " * 12 + st("dim", a + " " * max(1, n - len(a) - len(b)) + b + " UTC"))
+        return out
+
+    @staticmethod
+    def _trace_text(st, tr, width):
+        aw = max(34, min(58, width - 44))
+        out = ["", "  " + st("bold", tr["title"]), "    " + st("dim", tr["stats_line"]),
+               "    " + st("dim", "filter: ") + st("cyan", tr["filter"]), ""]
+        out.append("    " + st("dim", "%5s  %10s  %s" % ("PKT", "TIME", "client ".ljust(aw // 2) + " server".rjust(aw - aw // 2))))
+        for e in tr["ladder"]:
+            label = " " + e["label"] + " "
+            if e["d"] == 0:
+                arrow = "├" + label.ljust(aw - 2, "─")[:aw - 2] + "▶"
+            else:
+                arrow = "◀" + label.rjust(aw - 2, "─")[-(aw - 2):] + "┤"
+            col = {"r": "red", "o": "yellow", "p": "magenta"}.get(e["cls"])
+            note = ("  " + e["mark"]) if e["mark"] else ""
+            out.append("    %5d  %10s  %s%s" % (e["n"], e["t"], st(col, arrow) if col else arrow, st(col, note) if col else note))
+        if tr["omitted"]:
+            out.append("    " + st("dim", "(%d packets not shown)" % tr["omitted"]))
         return out
 
     @staticmethod
@@ -1165,12 +2121,16 @@ class Report:
                 elif t == "kpis":
                     sec["kpis"] = {k: v for k, v, _ in it["items"]}
                 elif t == "findings":
-                    sec["findings"] = [{"severity": a, "text": b} for a, b in it["items"]]
+                    sec["findings"] = [{"severity": x.sev, "text": x.text, "wireshark_filter": x.filt,
+                                        "packets": x.pkts, "packet_count": x.total} for x in it["items"]]
                 elif t == "timeline":
                     bins, lo, hi, bs = bin_series(it["per_second"], 60)
                     sec["timeline"] = {"start": lo, "end": hi, "seconds_per_bin": bs, "bytes": bins}
                 elif t == "hosts":
                     sec["hosts"] = it["hosts"]
+                elif t == "flowtraces":
+                    sec["flows"] = [{k: v for k, v in tr.items() if k in ("title", "client", "server", "filter", "extract", "stats", "ladder")}
+                                    for tr in it["traces"]]
                 elif t == "graph":
                     sec["graph"] = {"nodes": it["nodes"], "edges": [
                         {"a": a, "b": b, "bytes": by, "packets": pk} for a, b, by, pk in it["edges"]]}
@@ -1219,6 +2179,7 @@ dl.kv dt{color:var(--mute)}dl.kv dd{margin:0;font-variant-numeric:tabular-nums;w
 p.note{color:var(--mute);margin:6px 0;font-size:13px}
 .tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,430px),1fr));gap:14px;margin-top:6px}
 .tcard{border:1px solid var(--line);border-radius:10px;padding:10px 12px;overflow-x:auto}
+.tcard.wide{grid-column:1/-1}
 table{border-collapse:collapse;width:100%;font-size:13px}
 th,td{padding:4px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
 tr:last-child td{border-bottom:0}
@@ -1238,6 +2199,17 @@ td.txt{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .chart text{fill:var(--mute);font-size:11px}
 .chart .lbl{fill:var(--ink);stroke:var(--card);stroke-width:3px;paint-order:stroke}
 section>h3{margin-top:14px}
+.fbody{flex:1;min-width:0}.evid{font-size:12px;color:var(--mute);margin-top:2px;display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.evid code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink);word-break:break-all}
+button.copy{font-size:11px;border:1px solid var(--line);background:var(--card);color:var(--mute);border-radius:4px;padding:0 6px;cursor:pointer}
+button.copy:hover{color:var(--ink)}
+.trace{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:14px}
+.trace h3{color:var(--ink);font-size:14px;margin:0 0 4px}.trace .meta{font-size:12px;color:var(--mute);margin-bottom:6px}
+.trace .meta code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink);word-break:break-all}
+.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:12px;margin-top:8px}
+.chart .a-r{stroke:var(--high);fill:var(--high)}.chart .a-o{stroke:var(--med);fill:var(--med)}.chart .a-p{stroke:var(--c4);fill:var(--c4)}.chart .a-n{stroke:var(--c8);fill:var(--c8)}
+.chart .a-c{stroke:var(--c1);fill:var(--c1)}.chart .a-s{stroke:var(--c2);fill:var(--c2)}
+.chart .small{font-size:10px}
 section,.host{scroll-margin-top:56px}
 a.ip{color:var(--c1);text-decoration:none;border-bottom:1px dotted var(--c1)}a.ip:hover{border-bottom-style:solid}
 .hostlist{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}
@@ -1264,6 +2236,9 @@ a.back{font-size:12px;color:var(--mute);text-decoration:none}a.back:hover{color:
 HTML_JS = """
 (function(){var r=document.documentElement,b=document.querySelector('.theme');
 if(b)b.onclick=function(){var d=r.getAttribute('data-theme')==='dark'||(!r.getAttribute('data-theme')&&matchMedia('(prefers-color-scheme: dark)').matches);r.setAttribute('data-theme',d?'light':'dark')};
+document.addEventListener('click',function(e){var b=e.target.closest('.copy');if(!b)return;var t=b.dataset.t;
+try{navigator.clipboard.writeText(t)}catch(x){var r=document.createRange();r.selectNodeContents(b.previousElementSibling);getSelection().removeAllRanges();getSelection().addRange(r)}
+b.textContent='copied';setTimeout(function(){b.textContent='copy'},1200)});
 document.querySelectorAll('table.sortable th').forEach(function(th,i){th.onclick=function(){
 var t=th.closest('table'),tb=t.tBodies[0],dir=th.classList.contains('asc')?-1:1;
 t.querySelectorAll('th').forEach(function(x){x.classList.remove('asc','desc')});th.classList.add(dir===1?'asc':'desc');
@@ -1309,12 +2284,18 @@ def linkify(text):
     return "".join(out)
 
 
+CELL_RE = re.compile(r"^(?:\[([0-9a-fA-F:.]+)\](?::\d+)?|(\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?|([0-9a-fA-F]*:[0-9a-fA-F:.]*))(?=\s|$)")
+
+
 def linkify_cell(text):
     """Table cells: 'ip', 'ip  (name)', 'ip:port' or '[v6]:port' - link the address part only."""
-    m = re.match(r"^\[?([0-9a-fA-F:.]+)\]?(?=$|:\d+$|\s)", text)
-    if m and m.group(1) in LINKABLE:
-        s, e = m.span(1)
-        return _e(text[:s]) + '<a class="ip" href="#%s">%s</a>' % (host_id(m.group(1)), _e(m.group(1))) + _e(text[e:])
+    m = CELL_RE.match(text)
+    if m:
+        g = next(i for i in (1, 2, 3) if m.group(i))
+        ip = m.group(g)
+        if ip in LINKABLE:
+            s, e = m.span(g)
+            return _e(text[:s]) + '<a class="ip" href="#%s">%s</a>' % (host_id(ip), _e(ip)) + _e(text[e:])
     return _e(text)
 
 
@@ -1322,7 +2303,7 @@ def _html_table(it):
     headers, rows = it["headers"], it["rows"]
     bi = bar_col(headers)
     num = [all(_numlike(r[i]) for r in rows) for i in range(len(headers))]
-    out = ['<div class="tcard"><h3>%s</h3><table class="sortable"><thead><tr>' % _e(it["title"])]
+    out = ['<div class="tcard%s"><h3>%s</h3><table class="sortable"><thead><tr>' % (" wide" if len(headers) >= 5 else "", _e(it["title"]))]
     for i, h in enumerate(headers):
         out.append('<th class="%s">%s</th>' % ("num" if num[i] else "", _e(h)))
     out.append("</tr></thead><tbody>")
@@ -1463,6 +2444,107 @@ def _svg_graph(it):
     return "".join(out)
 
 
+def _svg_ladder(tr):
+    ev = tr["ladder"]
+    W, left, right, top, rh = 880, 215, 665, 52, 25
+    H = top + len(ev) * rh + 14
+    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Packet ladder diagram">' % (W, H)]
+    out.append('<defs>' + "".join(
+        '<marker id="ah%s" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
+        '<path d="M0,1 L10,5 L0,9 z" class="a-%s"/></marker>' % (c, c) for c in "ropnc") + '</defs>')
+    out.append('<text class="lbl" x="%d" y="16" text-anchor="middle">%s</text>' % (left, _e(tr["client"])))
+    out.append('<text x="%d" y="30" text-anchor="middle" class="small">client</text>' % left)
+    out.append('<text class="lbl" x="%d" y="16" text-anchor="middle">%s</text>' % (right, _e(tr["server"])))
+    out.append('<text x="%d" y="30" text-anchor="middle" class="small">server</text>' % right)
+    for x in (left, right):
+        out.append('<line x1="%d" x2="%d" y1="36" y2="%d" stroke="var(--c8)" stroke-width="2"/>' % (x, x, H - 6))
+    for i, e in enumerate(ev):
+        y = top + i * rh
+        x1, x2 = (left, right) if e["d"] == 0 else (right, left)
+        cls = e["cls"] or ("c" if e["d"] == 0 else "n")
+        out.append('<line x1="%d" y1="%d" x2="%d" y2="%d" class="a-%s" stroke-width="1.6" marker-end="url(#ah%s)"/>'
+                   % (x1, y, x2, y + 9, cls, cls))
+        out.append('<text x="%d" y="%d" text-anchor="middle" class="small lbl">%s</text>' % ((left + right) / 2, y - 3, _e(e["label"])))
+        out.append('<text x="6" y="%d" class="small">#%d  %s</text>' % (y + 4, e["n"], _e(e["t"])))
+        if e["mark"]:
+            out.append('<text x="%d" y="%d" text-anchor="end" class="small a-%s" stroke="none">%s</text>' % (W - 6, y + 4, cls, _e(e["mark"])))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _svg_tput(tr):
+    (b0, b1), t0, bs = tr["tput"]
+    W, H, L, B, T, R = 440, 190, 52, 24, 8, 8
+    n = len(b0)
+    mx = max(max(b0), max(b1), 1) * 8 / bs
+    pw, ph = W - L - R, H - T - B
+    bw = pw / n
+    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="Throughput over time">' % (W, H)]
+    for k in range(3):
+        y = T + ph - ph * k / 2
+        out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--line)"/>' % (L, W - R, y, y))
+        out.append('<text x="%d" y="%.1f" text-anchor="end" class="small">%s</text>' % (L - 4, y + 3, _e(human_bps(mx * k / 2) if k else "0")))
+    for series, cls, off in ((b0, "a-c", 0), (b1, "a-s", bw / 2)):
+        for i, v in enumerate(series):
+            if v:
+                h = max(1.0, ph * (v * 8 / bs) / mx)
+                out.append('<rect x="%.2f" y="%.2f" width="%.2f" height="%.2f" class="%s" stroke="none" opacity=".85"><title>%s</title></rect>'
+                           % (L + i * bw + off, T + ph - h, max(1.0, bw / 2 - 0.5), h, cls, _e(human_bps(v * 8 / bs))))
+    out.append('<text x="%d" y="%d" class="small">0 s</text><text x="%d" y="%d" text-anchor="end" class="small">%.2f s</text>'
+               % (L, H - 6, W - R, H - 6, bs * n))
+    out.append('<text x="%d" y="14" class="small a-c" stroke="none">client&#8594;server</text>'
+               '<text x="%d" y="14" class="small a-s" stroke="none">server&#8594;client</text>' % (L + 8, L + 110))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _svg_seq(tr):
+    pts = tr["pts"]
+    W, H, L, B, T, R = 440, 190, 52, 24, 8, 8
+    if not pts:
+        return ""
+    tmax = max(p[0] for p in pts) or 1e-6
+    smax = max(p[2] for p in pts) or 1
+    pw, ph = W - L - R, H - T - B
+    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="TCP sequence graph">' % (W, H)]
+    out.append('<line x1="%d" x2="%d" y1="%d" y2="%d" stroke="var(--line)"/><line x1="%d" x2="%d" y1="%d" y2="%d" stroke="var(--line)"/>'
+               % (L, W - R, T + ph, T + ph, L, L, T, T + ph))
+    for p in pts[:2500]:
+        x, y = L + pw * p[0] / tmax, T + ph - ph * p[2] / smax
+        if p[3]:
+            out.append('<circle cx="%.1f" cy="%.1f" r="3.2" class="a-r" stroke="none"><title>retransmission</title></circle>' % (x, y))
+        else:
+            out.append('<circle cx="%.1f" cy="%.1f" r="1.6" class="a-%s" stroke="none"/>' % (x, y, "c" if p[1] == 0 else "s"))
+    out.append('<text x="%d" y="%d" class="small">0 s</text><text x="%d" y="%d" text-anchor="end" class="small">%.2f s</text>'
+               % (L, H - 6, W - R, H - 6, tmax))
+    out.append('<text x="%d" y="14" class="small">sequence (bytes sent, per direction) over time</text>' % (L + 4))
+    out.append('<text x="%d" y="%d" text-anchor="end" class="small">%s</text>' % (L - 4, T + 8, _e(human_bytes(smax))))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _html_trace(tr):
+    return ('<div class="trace"><h3>%s</h3><div class="meta">%s<br>filter <code>%s</code> <button type="button" class="copy" data-t="%s">copy</button>'
+            ' &middot; extract: <code>%s</code></div>%s<div class="pair">%s%s</div></div>'
+            % (linkify(tr["title"]), _e(tr["stats_line"]), _e(tr["filter"]), _e(tr["filter"]), _e(tr["extract"]),
+               _svg_ladder(tr) + ('<p class="note">%d more packets not shown.</p>' % tr["omitted"] if tr["omitted"] else ""),
+               _svg_tput(tr), _svg_seq(tr)))
+
+
+def _html_finding(fd):
+    ev = ""
+    if fd.pkts or fd.filt:
+        bits = []
+        if fd.pkts:
+            bits.append('<span>%s</span>' % _e(evidence_text(fd)))
+        if fd.filt:
+            bits.append('<span>filter <code>%s</code> <button type="button" class="copy" data-t="%s">copy</button></span>'
+                        % (_e(fd.filt), _e(fd.filt)))
+        ev = '<div class="evid">%s</div>' % " &middot; ".join(bits)
+    return ('<div class="finding"><span class="badge %s">%s</span><div class="fbody"><div>%s</div>%s</div></div>'
+            % (fd.sev, SEVERITY[fd.sev][0], linkify(fd.text), ev))
+
+
 def _host_card(h):
     def mini(title, pairs, linkify_first=False):
         if not pairs:
@@ -1475,8 +2557,7 @@ def _host_card(h):
     if h["name"]:
         kv.insert(1, ("Name (from DNS)", h["name"]))
     dl = "".join("<dt>%s</dt><dd>%s</dd>" % (_e(k), _e(v)) for k, v in kv)
-    finds = "".join('<div class="finding"><span class="badge %s">%s</span><span>%s</span></div>' % (
-        sev, SEVERITY[sev][0], linkify(text)) for sev, text in h["findings"])
+    finds = "".join(_html_finding(fd) for fd in h["findings"])
     body = "".join([
         mini("Top peers (by bytes)", [("%s" % p, "%s, %s pkts" % (human_bytes(b), "{:,}".format(pk))) for p, b, pk in h["peers"]], True),
         mini("Protocols", [(k, "{:,}".format(v)) for k, v in h["protocols"]]),
@@ -1513,9 +2594,7 @@ def render_html(rep):
                     % (_e(l), _e(v), _e(sub)) for l, v, sub in it["items"]))
             elif it["t"] == "findings":
                 body = ('<div class="finding"><span class="ok">&#10004;</span><span>Nothing notable found by the built-in checks.</span></div>'
-                        if not it["items"] else "".join(
-                            '<div class="finding"><span class="badge %s">%s</span><span>%s</span></div>'
-                            % (sev, SEVERITY[sev][0], linkify(text)) for sev, text in it["items"]))
+                        if not it["items"] else "".join(_html_finding(x) for x in it["items"]))
                 parts.append('<section id="findings"><h2>Findings <span class="note" style="font-weight:400;color:var(--mute)">'
                              '(heuristics - verify before acting)</span></h2><div class="findings">%s</div></section>' % body)
     for s in rep.sections:
@@ -1548,7 +2627,11 @@ def render_html(rep):
                     i += 1
                 parts.append('<div class="donuts">%s</div>' % "".join(ds))
                 continue
-            if t == "hosts":
+            if t == "flowtraces":
+                parts.append('<p class="note">Packet-level view of the most problematic flows (and the biggest ones): '
+                             'ladder diagram, throughput and sequence graph. Packet numbers match the original capture file.</p>')
+                parts.extend(_html_trace(tr) for tr in it["traces"])
+            elif t == "hosts":
                 parts.append('<p class="note">Click an IP anywhere in this report to jump to its card.</p>'
                              '<div class="hostlist">%s</div>' % "".join(_host_card(h) for h in it["hosts"]))
             elif t == "note":
@@ -1576,7 +2659,7 @@ def top(counter, n, total=None, label=None):
     return rows
 
 
-def build_report(a, path, topn, whois=None):
+def build_report(a, path, topn, whois=None, traces=None, filter_desc=None):
     W = whois or {}
     R = Report()
     m = a.meta
@@ -1584,8 +2667,8 @@ def build_report(a, path, topn, whois=None):
     dur = (a.last_ts - a.first_ts) if a.first_ts is not None else 0
     ips = set(a.ip_tx_p) | set(a.ip_rx_p)
     obs = observations(a, dur)
-    nhigh = sum(1 for o in obs if o[0] == "high")
-    nmed = sum(1 for o in obs if o[0] == "medium")
+    nhigh = sum(1 for o in obs if o.sev == "high")
+    nmed = sum(1 for o in obs if o.sev == "medium")
 
     # ---- summary
     s = R.section("SUMMARY")
@@ -1614,6 +2697,8 @@ def build_report(a, path, topn, whois=None):
             R.kv(s, "Average rate", "%s, %.1f packets/s" % (human_bps(a.bytes * 8 / dur), a.pkts / dur))
     R.kv(s, "Unique IP addresses", "{:,}".format(len(ips)))
     R.kv(s, "Flows (TCP+UDP)", "{:,}".format(len(a.flows)))
+    if filter_desc:
+        R.kv(s, "Filter applied", "%s (packet numbers refer to the original file)" % filter_desc)
     if W:
         R.kv(s, "Whois", "%d of %d public IPs resolved (Team Cymru; country = registration country)" % (
             len(W), len(public_ips(ips))))
@@ -1673,6 +2758,32 @@ def build_report(a, path, topn, whois=None):
     if a.arp_ops:
         R.table(s, "ARP operations", ["Operation", "Packets", "%"], top(a.arp_ops, 5))
         R.kv(s, "Gratuitous ARP", a.arp_gratuitous)
+        unanswered = [ip for ip, n in a.arp_asked.items() if ip not in a.arp_replied and ip != "0.0.0.0"]
+        R.kv(s, "ARP requests never answered", "%d target(s)" % len(unanswered))
+    if a.neighbors:
+        R.table(s, "Discovered neighbours (LLDP / CDP)", ["Proto", "Device", "Port", "Port desc / platform", "Mgmt IP", "Description", "Source MAC"],
+                [(n["proto"], n.get("name") or n.get("chassis") or "-", n.get("port") or "-", n.get("port_desc") or n.get("platform") or "-",
+                  n.get("mgmt") or "-", n.get("desc") or "-", n["mac"]) for n in a.neighbors.values()][:topn * 2])
+    if a.stp_msgs:
+        R.kv(s, "Spanning tree BPDUs", ", ".join("%s: %d" % kv for kv in a.stp_msgs.items()))
+        R.kv(s, "STP root bridge(s)", "; ".join("%s (%d BPDUs)" % kv for kv in a.stp_roots.most_common(4)) or "-")
+        R.kv(s, "STP topology changes / root changes", "%d / %d" % (a.stp_tc, a.stp_root_changes))
+    if a.dhcp_xids:
+        xs = a.dhcp_xids.values()
+        R.kv(s, "DHCP transactions", "%d (DISCOVER w/o OFFER: %d, REQUEST w/o ACK/NAK: %d, NAKs: %d)" % (
+            len(a.dhcp_xids), sum(1 for x in xs if 1 in x["types"] and 2 not in x["types"]),
+            sum(1 for x in xs if 3 in x["types"] and not (x["types"] & {5, 6})), a.dhcp_nak))
+        R.table(s, "DHCP servers (senders of OFFER / ACK)", ["Server", "Messages"], [(k, v) for k, v in a.dhcp_servers.most_common(5)])
+    if a.bcast_ps or a.mcast_ps:
+        if a.bcast_ps:
+            sec, n = max(a.bcast_ps.items(), key=lambda kv: kv[1])
+            R.kv(s, "Peak broadcast rate", "%d frames/s at %s UTC" % (n, fmt_ts(sec)[11:19]))
+        if a.mcast_ps:
+            sec, n = max(a.mcast_ps.items(), key=lambda kv: kv[1])
+            R.kv(s, "Peak multicast rate", "%d frames/s at %s UTC" % (n, fmt_ts(sec)[11:19]))
+    multi = [(ip, sorted(m)) for ip, m in a.ip_macs.items() if len({x for x in m if not x.startswith(VIRTUAL_MACS)}) > 1
+             and ip != "0.0.0.0" and ip_class(ip) in ("private", "link-local")]
+    R.table(s, "IPs seen from several MACs (duplicate IP, failover or bridge)", ["IP", "MACs"], [(ip, ", ".join(m)) for ip, m in multi[:topn]])
 
     # ---- L3
     s = R.section("LAYER 3 - NETWORK (IP / ICMP)")
@@ -1745,6 +2856,8 @@ def build_report(a, path, topn, whois=None):
         R.table(s, "DSCP values", ["DSCP", "Packets", "%"], top(a.dscp, 5))
     if a.icmp:
         R.table(s, "ICMP / ICMPv6", ["Message", "Packets", "%"], top(a.icmp, topn))
+    R.table(s, "ICMP errors: who complained about which destination", ["Reporting device", "Error", "Original destination", "Count"],
+            [(r, k, d, "{:,}".format(c)) for (r, k, d), c in a.icmp_err.most_common(topn)])
     R.kv(s, "Fragmented packets", "{:,}".format(a.frags))
     if a.ipv6_ext:
         R.table(s, "IPv6 extension headers", ["Header", "Packets", "%"], top(a.ipv6_ext, 5))
@@ -1760,8 +2873,8 @@ def build_report(a, path, topn, whois=None):
     R.table(s, "TCP flag combinations", ["Flags", "Packets", "%"], top(a.tcp_flags, topn))
     tcp_flows = [(k, v) for k, v in a.flows.items() if v[2] == "tcp"]
     udp_flows = [(k, v) for k, v in a.flows.items() if v[2] == "udp"]
-    est = sum(1 for st in a.tcp_state.values() if st[4])
-    syn_only = sum(1 for st in a.tcp_state.values() if st[0] and not st[1])
+    est = sum(1 for fl in a.tcp_flows.values() if fl.established)
+    syn_only = sum(1 for fl in a.tcp_flows.values() if fl.syn is not None and fl.synack is None)
     R.kv(s, "TCP flows / UDP flows", "{:,} / {:,}".format(len(tcp_flows), len(udp_flows)))
     R.kv(s, "TCP handshakes completed", "{:,}".format(est))
     R.kv(s, "TCP SYN without reply", "{:,}".format(syn_only))
@@ -1778,6 +2891,25 @@ def build_report(a, path, topn, whois=None):
     R.table(s, "Top TCP flows (by bytes)", ["Endpoint A", "Endpoint B", "Packets", "Bytes"], flow_rows(tcp_flows))
     R.table(s, "Top UDP flows (by bytes)", ["Endpoint A", "Endpoint B", "Packets", "Bytes"], flow_rows(udp_flows))
 
+    # ---- per-flow TCP health
+    ranked_flows = sorted(a.tcp_flows.values(), key=lambda fl: -fl.score)
+
+    def flow_row(fl):
+        end = fl.end_state().replace("RST by client", "RST>").replace("RST by server", "<RST").replace("no SYN/ACK", "no-reply")
+        return (fmt_ep(fl.ep[0]), fmt_ep(fl.ep[1]), "%.2fs" % fl.duration, human_bytes(sum(fl.bytes)), fmt_ms(fl.handshake_ms),
+                fmt_ms(fl.rtt_ms), fl.retrans, fl.dupack, fl.zwin, fl.ooo, end, ", ".join(str(p) for p in fl.pk[:6]) or "-")
+    fh = ["Client", "Server", "Dur", "Bytes", "HS", "RTT", "Retx", "Dup", "ZW", "OOO", "End", "Packets of interest"]
+    R.table(s, "TCP flows needing attention (worst first)", fh, [flow_row(fl) for fl in ranked_flows if fl.score > 0][:topn])
+    R.table(s, "Largest TCP flows (by bytes)", fh, [flow_row(fl) for fl in sorted(a.tcp_flows.values(), key=lambda fl: -sum(fl.bytes))[:topn]])
+    R.note(s, "HS = handshake time, Retx = retransmissions, Dup = duplicate ACKs, ZW = zero-window, OOO = out-of-order, "
+              "End: RST> = reset by client, <RST = reset by server.")
+    ends = Counter(fl.end_state().split(" by ")[0] for fl in a.tcp_flows.values())
+    R.table(s, "How TCP flows ended", ["State", "Flows", "%"], top(ends, 6))
+    beacons = find_beacons(a)
+    R.table(s, "Periodic connections (beaconing / polling check)", ["Source", "Destination", "Service", "Count", "Every", "Jitter"],
+            [(b_["src"], b_["dst"], "%d/%s %s" % (b_["port"], b_["proto"], SERVICES.get(b_["port"], "")), b_["count"],
+              "%.1f s" % b_["mean"], "%.0f%%" % (b_["cv"] * 100)) for b_ in beacons[:topn]])
+
     # ---- L5/6
     s = R.section("LAYER 5-6 - SESSION / PRESENTATION (TLS)")
     R.kv(s, "ClientHello / ServerHello", "{:,} / {:,}".format(a.tls_clienthello, a.tls_serverhello))
@@ -1787,6 +2919,25 @@ def build_report(a, path, topn, whois=None):
     R.table(s, "ALPN protocols offered", ["ALPN", "Count", "%"], top(a.tls_alpn, 6))
     R.table(s, "Server-selected cipher suites (IANA id)", ["Cipher", "Count", "%"], top(a.tls_ciphers, 6))
     R.table(s, "Other TLS records", ["Type", "Records", "%"], top(a.tls_records, 6))
+    ref = a.first_ts if a.first_ts is not None else 0
+
+    def cert_rows():
+        rows = []
+        for c in a.certs[:topn * 2]:
+            flags = [x for x, on in (("self-signed", c["self_signed"]), ("EXPIRED", c["not_after"] is not None and c["not_after"] < ref)) if on]
+            left = "%d d" % ((c["not_after"] - ref) / 86400) if c["not_after"] is not None else "-"
+            rows.append((fmt_ep(c["server"]), c["sni"] or "-", c["subject"].get("CN", "-"),
+                         c["issuer"].get("O") or c["issuer"].get("CN") or "-",
+                         "%s \u2192 %s" % (fmt_ts(c["not_before"])[:10] if c["not_before"] else "?", fmt_ts(c["not_after"])[:10] if c["not_after"] else "?"),
+                         left, c["key"], c["sig"], ", ".join(flags) or "-"))
+        return rows
+    R.table(s, "Server certificates seen (TLS 1.2 and older; TLS 1.3 encrypts them)",
+            ["Server", "SNI", "Subject CN", "Issuer", "Valid", "Days left", "Key", "Signature", "Flags"], cert_rows())
+    R.table(s, "TLS client fingerprints (JA3)", ["JA3", "Hellos", "Clients", "Example server names"],
+            [(h, n, len(a.ja3_info[h]["clients"]), ", ".join(x for x, _ in a.ja3_info[h]["sni"].most_common(2)) or "-")
+             for h, n in a.ja3.most_common(topn)])
+    if a.tls_split:
+        R.note(s, "%d TLS hellos were split over several packets and could not be fingerprinted." % a.tls_split)
     if not (a.tls_clienthello or a.tls_serverhello or a.tls_versions or a.tls_records):
         R.note(s, "No TLS handshakes found.")
     R.note(s, "QUIC (UDP/443) packets seen: {:,}  (encrypted, SNI not visible here)".format(a.quic))
@@ -1811,6 +2962,62 @@ def build_report(a, path, topn, whois=None):
     if a.ntp:
         R.kv(s, "NTP packets", "{:,}".format(a.ntp))
 
+    # ---- latency
+    s = R.section("LATENCY")
+    hs_ms = [fl.handshake_ms for fl in a.tcp_flows.values() if fl.handshake_ms is not None]
+    rtt_ms = [fl.rtt_ms for fl in a.tcp_flows.values() if fl.rtt_ms is not None]
+    lat_rows = []
+    for name, vals in (("TCP handshake (SYN \u2192 SYN/ACK)", hs_ms), ("TCP data \u2192 ACK (RTT estimate per flow)", rtt_ms),
+                       ("DNS query \u2192 response", [x[0] for x in a.dns_lat]),
+                       ("TLS ClientHello \u2192 ServerHello", [x[0] for x in a.tls_lat]),
+                       ("HTTP request \u2192 response", [x[0] for x in a.http_tx])):
+        st_ = lat_stats(vals)
+        if st_:
+            lat_rows.append((name, "{:,}".format(st_[0]), fmt_ms(st_[1]), fmt_ms(st_[2]), fmt_ms(st_[3]), fmt_ms(st_[4])))
+    R.table(s, "Response times", ["Metric", "Samples", "Min", "Median", "95th pct", "Max"], lat_rows)
+    horizon = (a.last_ts or 0) - 2
+    R.kv(s, "DNS queries without a response", "%d" % sum(1 for v in a.dns_pending.values() if v[0] < horizon))
+    by_srv = defaultdict(list)
+    for ms_, name, server, rc, qp, rp in a.dns_lat:
+        by_srv[server].append((ms_, rc))
+    R.table(s, "DNS latency by resolver", ["Resolver", "Queries", "Median", "95th pct", "Max", "Errors"],
+            [(srv, len(v), fmt_ms(pctl(sorted(x for x, _ in v), 50)), fmt_ms(pctl(sorted(x for x, _ in v), 95)),
+              fmt_ms(max(x for x, _ in v)), sum(1 for _, rc in v if rc != "NOERROR"))
+             for srv, v in sorted(by_srv.items(), key=lambda kv: -len(kv[1]))[:topn]])
+    R.table(s, "Slowest DNS queries", ["Time", "Name", "Resolver", "Result", "Packets"],
+            [(fmt_ms(x[0]), x[1], x[2], x[3], "%d \u2192 %d" % (x[4], x[5])) for x in sorted(a.dns_lat, reverse=True)[:topn]])
+    R.table(s, "Slowest HTTP transactions", ["Time", "Host / path", "Status", "Server", "Packets"],
+            [(fmt_ms(x[0]), "%s%s" % (x[1], x[2]), x[3] or "-", x[4], "%d \u2192 %d" % (x[5], x[6])) for x in sorted(a.http_tx, reverse=True)[:topn]])
+    R.table(s, "Slowest TLS handshakes (ClientHello \u2192 ServerHello)", ["Time", "Server name", "Server", "Version", "Packets"],
+            [(fmt_ms(x[0]), x[1] or "-", x[2], x[3], "%d \u2192 %d" % (x[4], x[5])) for x in sorted(a.tls_lat, reverse=True)[:topn]])
+    R.table(s, "Slowest TCP handshakes", ["Time", "Client", "Server", "SNI", "First packet"],
+            [(fmt_ms(fl.handshake_ms), fmt_ep(fl.ep[0]), fmt_ep(fl.ep[1]), fl.sni or "-", fl.n0)
+             for fl in sorted((x for x in a.tcp_flows.values() if x.handshake_ms is not None), key=lambda x: -x.handshake_ms)[:topn]])
+    R.note(s, "Handshake and RTT values are measured at the capture point: at the client they equal the network round trip,")
+    R.note(s, "at the server they mostly show the client-side delay. Compare both ends when in doubt.")
+
+    # ---- path / MTU
+    s = R.section("PATH / MTU / TCP OPTIONS")
+    mss_rows = [(side, m, c, pct(c, sum(cnt.values()))) for side, cnt in a.tcp_mss.items() for m, c in cnt.most_common(6)]
+    R.table(s, "TCP MSS announced", ["Side", "MSS", "SYNs", "%"], mss_rows)
+    ws_rows = [(side, w_, c, pct(c, sum(cnt.values()))) for side, cnt in a.tcp_ws.items() for w_, c in cnt.most_common(6)]
+    R.table(s, "TCP window scale announced", ["Side", "Shift", "SYNs", "%"], ws_rows)
+    R.table(s, "TCP options negotiated on SYNs", ["Option", "Count"], [(k, v) for k, v in sorted(a.tcp_opts.items())])
+    R.table(s, "IPv4 Don't-Fragment bit", ["DF", "Packets", "%"], top(a.df, 3))
+    R.table(s, "Path-MTU reports (ICMP fragmentation needed / packet too big)", ["Reporting device", "Next-hop MTU", "Original sender", "Original destination", "Packet"],
+            [(r_, m_, o_, d_, p_) for r_, m_, o_, d_, p_ in a.pmtu[:topn]])
+    holes = [fl for fl in a.tcp_flows.values() if fl.blackhole]
+    R.table(s, "Possible PMTU black holes (full-size segments retransmitted)", ["Client", "Server", "Largest segment", "Retransmissions", "Packets"],
+            [(fmt_ep(fl.ep[0]), fmt_ep(fl.ep[1]), fl.max_seg, fl.retrans, ", ".join(str(p) for p in fl.pk[:6])) for fl in holes[:topn]])
+    R.kv(s, "Largest TCP segment seen", "%d bytes" % max((fl.max_seg for fl in a.tcp_flows.values()), default=0))
+    R.kv(s, "Frames larger than 1514 bytes", "{:,} (GRO/TSO offload in the capture, or jumbo frames)".format(sum(1 for x in a.sizes if x > 1514)))
+    R.note(s, "Pair this with 'ipx --mtu <host>' to measure the real path MTU towards a suspect destination.")
+
+    # ---- flow traces (second pass over the file)
+    if traces:
+        s = R.section("FLOW TRACES (ladder diagrams)")
+        R.flowtraces(s, traces)
+
     # ---- host cards (link targets for every IP in the HTML report)
     s = R.section("HOSTS")
     hosts = []
@@ -1824,7 +3031,7 @@ def build_report(a, path, topn, whois=None):
             "protocols": a.ip_stacks[ip].most_common(6),
             "services": a.ip_services[ip].most_common(6),
             "sni": a.ip_sni[ip].most_common(5), "http": a.ip_http[ip].most_common(5), "dns": a.ip_dnsq[ip].most_common(5),
-            "findings": [o for o in obs if mention.search(o[1])],
+            "findings": [o for o in obs if mention.search(o.text)],
         })
     R.hosts(s, hosts)
     R.meta["linkable"] = {h["ip"] for h in hosts}
@@ -1841,56 +3048,360 @@ def _ttl_guess(t):
     return "low: multicast/link-local or many hops"
 
 
+def _ipf(ip, field="addr"):
+    return ("ipv6." if ":" in ip else "ip.") + field
+
+
+def fmt_ep(ep):
+    return "[%s]:%d" % ep if ":" in ep[0] else "%s:%d" % ep
+
+
+BENIGN_PERIODIC = {123, 53, 5353, 1900, 137, 138, 67, 68, 5355, 546, 547, 161}
+VIRTUAL_MACS = ("00:00:5e:00:01", "00:00:5e:00:02", "00:00:0c:07:ac", "00:07:b4:00")
+
+
+def find_beacons(a):
+    """Connections from one host to one service at regular intervals (beaconing / polling)."""
+    res = []
+    for (src, dst, port, proto), ts in a.conn_times.items():
+        if len(ts) < 6 or src == dst:
+            continue
+        ts = sorted(ts)
+        iv = [y - x for x, y in zip(ts, ts[1:])]
+        mean = sum(iv) / len(iv)
+        if mean < 1.0 or mean > 4000:
+            continue
+        cv = math.sqrt(sum((x - mean) ** 2 for x in iv) / len(iv)) / mean
+        if cv <= 0.2:
+            res.append({"src": src, "dst": dst, "port": port, "proto": proto, "count": len(ts), "mean": mean, "cv": cv})
+    res.sort(key=lambda r: (-r["count"], r["cv"]))
+    return res
+
+
 def observations(a, dur):
-    """Heuristic findings as (severity, text); severity is high / medium / info."""
+    """Heuristic findings with evidence: Finding(severity, text, wireshark filter, packet numbers, total)."""
     out = []
+    now = datetime.now(timezone.utc).timestamp()
+
+    def add(sev, text, filt="", keys=(), pkts=None):
+        if pkts is not None:
+            u = sorted(set(pkts))
+            out.append(Finding(sev, text, filt, u[:12], len(u)))
+        else:
+            merged = sorted({p for k in keys for p in a.ev.get(k, [])})
+            out.append(Finding(sev, text, filt, merged[:12], sum(a.evn.get(k, 0) for k in keys)))
+
+    # ---- TCP behaviour
     for src, targets in a.syn_targets.items():
         unanswered = [t for t in targets if (src, t[0], t[1]) not in a.answered]
         hosts = {t[0] for t in unanswered}
         ports = {t[1] for t in unanswered}
         if len(unanswered) >= 20 and len(unanswered) >= 0.8 * len(targets):
             kind = "port scan" if len(ports) > len(hosts) else "host sweep"
-            out.append(("high", "Possible TCP %s from %s: %d unanswered SYNs to %d host(s) / %d port(s)." % (
-                kind, src, len(unanswered), len(hosts), len(ports))))
+            add("high", "Possible TCP %s from %s: %d unanswered SYNs to %d host(s) / %d port(s)." % (
+                kind, src, len(unanswered), len(hosts), len(ports)),
+                "%s==%s && tcp.flags.syn==1 && tcp.flags.ack==0" % (_ipf(src, "src"), src), ("scan:" + src,))
+    flows = list(a.tcp_flows.values())
     tcp_pk = a.l4.get("TCP", 0)
     if tcp_pk > 100 and a.retrans / tcp_pk > 0.02:
-        out.append(("medium", "High TCP retransmission rate: %s of TCP packets (possible loss/congestion)." % pct(a.retrans, tcp_pk)))
+        add("medium", "High TCP retransmission rate: %s of TCP packets (possible loss/congestion)." % pct(a.retrans, tcp_pk),
+            "tcp.analysis.retransmission", ("retrans",))
+    if a.dupacks >= 20 and tcp_pk > 100 and a.dupacks / tcp_pk > 0.01:
+        add("medium", "%d duplicate ACKs (%s of TCP packets): packets are being lost or reordered on the path." % (
+            a.dupacks, pct(a.dupacks, tcp_pk)), "tcp.analysis.duplicate_ack", ("dupack",))
     if tcp_pk > 100 and a.rst / tcp_pk > 0.05:
-        out.append(("medium", "Many TCP resets: %s of TCP packets (refused ports, aborted sessions or a scan)." % pct(a.rst, tcp_pk)))
+        add("medium", "Many TCP resets: %s of TCP packets (refused ports, aborted sessions or a scan)." % pct(a.rst, tcp_pk),
+            "tcp.flags.reset==1", ("rst",))
     if a.zero_win:
-        out.append(("medium", "%d zero-window packets: a receiver could not keep up." % a.zero_win))
+        add("medium", "%d zero-window packets: a receiver could not keep up." % a.zero_win, "tcp.analysis.zero_window", ("zerowin",))
+    noreply = [fl for fl in flows if fl.syn is not None and fl.synack is None and fl.rst == 0]
+    if len(noreply) >= 5:
+        targets = Counter(fl.ep[1][0] for fl in noreply)
+        add("medium", "%d TCP connection attempts got no SYN/ACK or RST (silent drop by a firewall, or host down); most to %s." % (
+            len(noreply), targets.most_common(1)[0][0]),
+            "tcp.flags.syn==1 && tcp.flags.ack==0 && !tcp.analysis.retransmission", pkts=[fl.n0 for fl in noreply if fl.n0])
+    slow_hs = sorted((fl for fl in flows if fl.handshake_ms is not None and fl.handshake_ms > 500), key=lambda fl: -fl.handshake_ms)
+    if slow_hs:
+        add("info", "%d TCP handshakes took over 500 ms (slowest %s to %s): high path latency or a loaded server." % (
+            len(slow_hs), fmt_ms(slow_hs[0].handshake_ms), fmt_ep(slow_hs[0].ep[1])),
+            "tcp.analysis.initial_rtt > 0.5", pkts=[fl.n0 for fl in slow_hs if fl.n0])
+    # ---- path MTU
+    groups = defaultdict(list)
+    for rep_ip, mtu, osrc, odst, pkt in a.pmtu:
+        groups[(rep_ip, mtu)].append((odst, pkt))
+    for (rep_ip, mtu), lst in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        add("high", "%s reported next-hop MTU %d (fragmentation needed / packet too big) %d time(s) for traffic to %s - "
+            "a path MTU problem if large packets are being dropped." % (rep_ip, mtu, len(lst), lst[0][0]),
+            "icmp.type == 3 && icmp.code == 4 || icmpv6.type == 2", pkts=[p for _, p in lst])
+    for fl in flows:
+        if fl.blackhole:
+            add("medium", "Possible path-MTU black hole: %s -> %s retransmitted full-size segments %d times (largest segment %d bytes)." % (
+                fmt_ep(fl.ep[0]), fmt_ep(fl.ep[1]), fl.retrans, fl.max_seg), flow_filter(fl.ep[0], fl.ep[1]), pkts=fl.pk)
+    csyn = a.tcp_mss["client (SYN)"]
+    low = sum(c for m, c in csyn.items() if m < 1400)
+    if csyn and low and low / sum(csyn.values()) >= 0.1:
+        lowest = min(m for m in csyn if m < 1400)
+        add("info", "%s of client SYNs announce an MSS below 1400 (lowest %d): a tunnel/VPN, PPPoE or an MSS clamp is on the path." % (
+            pct(low, sum(csyn.values())), lowest), "tcp.flags.syn==1 && tcp.options.mss_val < 1400")
+    # ---- cleartext
+    clear_filters = {"FTP login": 'ftp.request.command == "USER" || ftp.request.command == "PASS"', "Telnet session": "telnet",
+                     "SMTP AUTH": 'smtp.req.command == "AUTH"', "POP3 login": "pop", "IMAP login": "imap",
+                     "HTTP Basic auth": "http.authbasic", "HTTP POST with password field": 'http.request.method == "POST"'}
     for what, n in a.cleartext.items():
         hosts = ", ".join(sorted(a.cleartext_hosts[what])[:5])
-        out.append(("high", "Cleartext traffic: %s (%d packets) to/from %s - credentials/data may be readable." % (what, n, hosts)))
+        add("high", "Cleartext traffic: %s (%d packets) to/from %s - credentials/data may be readable." % (what, n, hosts),
+            clear_filters.get(what, ""), ("clear:" + what,))
+    # ---- TLS
     for what, n in a.tls_old.items():
-        out.append(("medium", "Deprecated TLS: %d handshake(s) where the %s." % (n, what)))
+        add("medium", "Deprecated TLS: %d handshake(s) where the %s." % (n, what), "tls.handshake.version < 0x0303", ("tls-old",))
+    ref = a.first_ts if a.first_ts is not None else now
+    for c in a.certs:
+        cn = c["subject"].get("CN", "?")
+        srv = fmt_ep(c["server"])
+        flt = "tls.handshake.type == 11 && %s==%s" % (_ipf(c["server"][0]), c["server"][0])
+        if c["not_after"] is not None and c["not_after"] < ref:
+            add("high", "Expired certificate for %s (CN %s) on %s: expired %s." % (c["sni"] or cn, cn, srv, fmt_ts(c["not_after"])[:10]), flt, pkts=[c["pkt"]])
+        elif c["not_after"] is not None and c["not_after"] - ref < 30 * 86400:
+            add("medium", "Certificate for %s (CN %s) on %s expires within 30 days (%s)." % (c["sni"] or cn, cn, srv, fmt_ts(c["not_after"])[:10]), flt, pkts=[c["pkt"]])
+        if c["not_before"] is not None and c["not_before"] > ref + 86400:
+            add("medium", "Certificate for %s on %s is not valid yet (starts %s)." % (cn, srv, fmt_ts(c["not_before"])[:10]), flt, pkts=[c["pkt"]])
+        if c["self_signed"]:
+            add("medium", "Self-signed certificate (CN %s) presented by %s." % (cn, srv), flt, pkts=[c["pkt"]])
+        if "sha1" in c["sig"].lower() or "md5" in c["sig"].lower():
+            add("medium", "Weak certificate signature %s (CN %s on %s)." % (c["sig"], cn, srv), flt, pkts=[c["pkt"]])
+        if c["key"].startswith("RSA") and int(c["key"].split()[1]) < 2048:
+            add("medium", "Short RSA key (%s) in certificate CN %s on %s." % (c["key"], cn, srv), flt, pkts=[c["pkt"]])
+        names = c["san"] or ([cn] if cn != "?" else [])
+        if c["sni"] and names and not host_matches(c["sni"], names):
+            add("medium", "Certificate name mismatch: client asked for %s but %s presented %s." % (
+                c["sni"], srv, ", ".join(names[:3])), flt, pkts=[c["pkt"]])
+    # ---- DNS
     nx = a.dns_rcode.get("NXDOMAIN", 0)
     if a.dns_responses >= 20 and nx / a.dns_responses > 0.3:
-        out.append(("medium", "%s of DNS responses are NXDOMAIN (possible DGA/malware or misconfiguration)." % pct(nx, a.dns_responses)))
+        add("medium", "%s of DNS responses are NXDOMAIN (possible DGA/malware or misconfiguration)." % pct(nx, a.dns_responses),
+            "dns.flags.rcode == 3", ("nxdomain",))
     if len(a.dns_long) >= 5:
-        out.append(("medium", "%d DNS queries with very long names (e.g. %s) - check for DNS tunnelling." % (len(a.dns_long), a.dns_long[0][:60])))
+        add("medium", "%d DNS queries with very long names (e.g. %s) - check for DNS tunnelling." % (len(a.dns_long), a.dns_long[0][:60]),
+            "dns.qry.name.len > 60", ("dns-long",))
     if a.dns_qtype.get("TXT", 0) > 20 or a.dns_qtype.get("ANY", 0) > 5:
-        out.append(("info", "Unusual DNS types: TXT=%d ANY=%d." % (a.dns_qtype.get("TXT", 0), a.dns_qtype.get("ANY", 0))))
+        add("info", "Unusual DNS types: TXT=%d ANY=%d." % (a.dns_qtype.get("TXT", 0), a.dns_qtype.get("ANY", 0)),
+            "dns.qry.type == 16 || dns.qry.type == 255")
+    horizon = (a.last_ts or 0) - 2
+    lost = [v for v in a.dns_pending.values() if v[0] < horizon]
+    if len(lost) >= 3:
+        srv = Counter(v[4] for v in lost).most_common(1)[0][0]
+        add("medium", "%d DNS queries got no response (most to %s): resolver down or blocked, or the replies are not in this capture." % (
+            len(lost), srv), "dns.flags.response == 0 && !dns.response_in", pkts=[v[3] for v in lost])
+    bysrv = defaultdict(list)
+    for ms_, name, server, rc, qp, rp in a.dns_lat:
+        bysrv[server].append((ms_, rp))
+    for server, lst in bysrv.items():
+        if len(lst) >= 5:
+            med = pctl(sorted(x for x, _ in lst), 50)
+            if med > 150:
+                add("medium", "Slow DNS resolver %s: median response %s over %d queries." % (server, fmt_ms(med), len(lst)),
+                    "dns.time > 0.15", pkts=[p for _, p in sorted(lst, reverse=True)[:12]])
+    # ---- HTTP / TLS timing
+    e5 = [t for t in a.http_tx if t[3].startswith("5")]
+    if len(e5) >= 5:
+        add("medium", "%d HTTP 5xx server errors (e.g. %s %s)." % (len(e5), e5[0][3], e5[0][1]), "http.response.code >= 500", pkts=[t[6] for t in e5])
+    if len(a.http_tx) >= 5:
+        st = lat_stats([t[0] for t in a.http_tx])
+        if st[3] > 1000:
+            add("info", "Slow HTTP responses: 95th percentile %s (median %s) over %d requests." % (fmt_ms(st[3]), fmt_ms(st[2]), st[0]),
+                "http.time > 1", pkts=[t[6] for t in sorted(a.http_tx, reverse=True)[:12]])
+    if len(a.tls_lat) >= 3:
+        st = lat_stats([t[0] for t in a.tls_lat])
+        if st[2] > 1000:
+            add("info", "Slow TLS handshakes: median ClientHello->ServerHello %s over %d handshakes." % (fmt_ms(st[2]), st[0]),
+                "tls.handshake.type == 2", pkts=[t[5] for t in sorted(a.tls_lat, reverse=True)[:12]])
+    # ---- layer 2
     for ip, macs in a.arp_map.items():
         if len(macs) > 1:
-            out.append(("high", "ARP: %s claimed by %d different MACs (%s) - conflict or ARP spoofing." % (ip, len(macs), ", ".join(sorted(macs)))))
+            add("high", "ARP: %s claimed by %d different MACs (%s) - conflict or ARP spoofing." % (ip, len(macs), ", ".join(sorted(macs))),
+                "arp.src.proto_ipv4 == %s" % ip, ("arpconf:" + ip,))
+    for ip, macs in a.ip_macs.items():
+        real = {m for m in macs if not m.startswith(VIRTUAL_MACS)}
+        if len(real) > 1 and ip != "0.0.0.0" and ip_class(ip) in ("private", "link-local"):
+            add("medium", "IP %s is sent from %d different MACs (%s) - duplicate IP, bonding/failover or a bridge." % (
+                ip, len(real), ", ".join(sorted(real))), "%s==%s" % (_ipf(ip, "src"), ip))
     if a.arp_gratuitous > 5:
-        out.append(("info", "%d gratuitous ARP packets." % a.arp_gratuitous))
+        add("info", "%d gratuitous ARP packets." % a.arp_gratuitous, "arp.isgratuitous", ("arp-gratuitous",))
+    for spa, tg in a.arp_targets.items():
+        if len(tg) >= 50:
+            add("medium", "ARP sweep: %s asked for %d different IPs." % (spa, len(tg)), "arp.src.proto_ipv4 == %s && arp.opcode == 1" % spa)
+    if a.arp_req_ps and max(a.arp_req_ps.values()) >= 100:
+        sec, n = max(a.arp_req_ps.items(), key=lambda kv: kv[1])
+        add("medium", "ARP storm candidate: %d ARP requests in one second (%s UTC)." % (n, fmt_ts(sec)[11:19]), "arp.opcode == 1")
+    silent = [ip for ip, n in a.arp_asked.items() if n >= 3 and ip not in a.arp_replied and ip != "0.0.0.0"]
+    if silent:
+        add("medium", "%d IP(s) were ARPed repeatedly but never answered (host down, wrong subnet or filtered), e.g. %s." % (len(silent), silent[0]),
+            "arp.opcode == 1", pkts=[p for ip in silent for p in a.arp_req_pkts[ip]])
+    storm = max(a.bcast_ps.items(), key=lambda kv: kv[1], default=(0, 0))
+    if storm[1] >= 500:
+        add("medium", "Broadcast storm candidate: %d broadcast frames in one second (%s UTC)." % (storm[1], fmt_ts(storm[0])[11:19]),
+            "eth.dst == ff:ff:ff:ff:ff:ff")
+    nodisc = [x for x in a.dhcp_xids.values() if 1 in x["types"] and 2 not in x["types"]]
+    if nodisc:
+        add("medium", "%d DHCP DISCOVER(s) got no OFFER (no DHCP server reachable?), e.g. client %s." % (len(nodisc), nodisc[0]["mac"]),
+            "dhcp.option.dhcp == 1", pkts=[x["pkt"] for x in nodisc])
+    noack = [x for x in a.dhcp_xids.values() if 3 in x["types"] and not (x["types"] & {5, 6})]
+    if noack:
+        add("medium", "%d DHCP REQUEST(s) got neither ACK nor NAK." % len(noack), "dhcp.option.dhcp == 3", pkts=[x["pkt"] for x in noack])
+    if a.dhcp_nak:
+        add("medium", "%d DHCP NAK(s): clients were refused their requested address." % a.dhcp_nak, "dhcp.option.dhcp == 6", ("dhcp-nak",))
+    if len(a.dhcp_servers) > 1:
+        add("high", "Multiple DHCP servers answered: %s - a rogue or second DHCP server on the segment?" % ", ".join(sorted(a.dhcp_servers)),
+            "dhcp.option.dhcp == 2 || dhcp.option.dhcp == 5")
+    if a.stp_root_changes:
+        add("medium", "Spanning-tree root bridge changed %d time(s); roots seen: %s." % (a.stp_root_changes, "; ".join(a.stp_roots)),
+            "stp", ("stp-root",))
+    if a.stp_tc >= 3:
+        add("medium", "%d spanning-tree topology-change notifications (flapping port or loop?)." % a.stp_tc, "stp.flags.tc == 1", ("stp-tc",))
+    # ---- ICMP / fragmentation / capture quality
     echo = a.icmp.get("echo-request (type 8 code 0)", 0)
     if echo > 100 and dur > 0 and echo / dur > 50:
-        out.append(("medium", "ICMP echo-request rate %.0f/s (ping flood or sweep)." % (echo / dur)))
+        add("medium", "ICMP echo-request rate %.0f/s (ping flood or sweep)." % (echo / dur), "icmp.type == 8")
     if a.udp_port_unreach > 20:
-        out.append(("info", "%d ICMP port-unreachable messages (UDP to closed ports, possible UDP scan)." % a.udp_port_unreach))
+        add("info", "%d ICMP port-unreachable messages (UDP to closed ports, possible UDP scan)." % a.udp_port_unreach,
+            "icmp.type == 3 && icmp.code == 3", ("icmp-unreach",))
     if a.frags > 0:
-        out.append(("info", "%d fragmented IP packets (check MTU issues or evasion)." % a.frags))
+        add("info", "%d fragmented IP packets (check MTU issues or evasion)." % a.frags, "ip.flags.mf == 1 || ip.frag_offset > 0", ("frag",))
+    # ---- periodic connections
+    for bc in find_beacons(a)[:8]:
+        benign = bc["port"] in BENIGN_PERIODIC
+        sev = "info" if benign or ip_class(bc["dst"]) != "public" else "medium"
+        add(sev, "Periodic %s connections %s -> %s:%d every %.1f s (%d times, jitter %.0f%%)%s." % (
+            bc["proto"].upper(), bc["src"], bc["dst"], bc["port"], bc["mean"], bc["count"], bc["cv"] * 100,
+            " - normal for this service" if benign else " - polling or beaconing; check what the client is"),
+            "%s==%s && %s==%s" % (_ipf(bc["src"]), bc["src"], _ipf(bc["dst"]), bc["dst"]))
     if a.truncated:
-        out.append(("info", "%d packets are truncated by the snap length; payload analysis is incomplete for them." % a.truncated))
+        add("info", "%d packets are truncated by the snap length; payload analysis is incomplete for them." % a.truncated,
+            "frame.cap_len < frame.len")
     if a.malformed:
-        out.append(("info", "Malformed packets: " + ", ".join("%s (%d)" % kv for kv in a.malformed.items()) + "."))
+        add("info", "Malformed packets: " + ", ".join("%s (%d)" % kv for kv in a.malformed.items()) + ".", "_ws.malformed")
     return out
 
 
+# ------------------------------------------------------------------ flow traces (second pass)
+
+def pick_flows(a, limit=6):
+    """Worst TCP flows first, then the biggest ones."""
+    items = list(a.tcp_flows.items())
+    chosen = sorted((kv for kv in items if kv[1].score > 0), key=lambda kv: -kv[1].score)[:4]
+    for kv in sorted(items, key=lambda kv: -sum(kv[1].bytes)):
+        if len(chosen) >= limit or sum(1 for c in chosen if c[1].score <= 0) >= 2:
+            break
+        if kv not in chosen and sum(kv[1].bytes) > 0:
+            chosen.append(kv)
+    return [k for k, _ in chosen]
+
+
+def _pkt_label(flags, rs, ra, plen):
+    s = "[%s]" % flags_str(flags).replace("+", ",")
+    out = "%s seq=%d" % (s, rs)
+    if ra is not None:
+        out += " ack=%d" % ra
+    if plen:
+        out += " len=%d" % plen
+    return out
+
+
+def _rel(t, t0):
+    d = (t - t0) * 1000.0 if t is not None and t0 is not None else 0.0
+    return "+%.1f ms" % d if d < 1000 else "+%.3f s" % (d / 1000.0)
+
+
+def build_traces(path, a, pf_kwargs, keys, cmd_path):
+    """Re-read the capture and collect packet events for the chosen TCP flows."""
+    if not keys:
+        return []
+    sel = {k: {"flow": TcpFlow(a.tcp_flows[k].ep[0], a.tcp_flows[k].ep[1]), "ev": [], "pts": [], "seq0": [None, None], "t0": None}
+           for k in keys}
+    pf = PacketFilter(**pf_kwargs)
+    n = 0
+    try:
+        fh = open_capture(path)
+        with fh:
+            for ts, caplen, origlen, link, data in iter_packets(fh, {}):
+                n += 1
+                if pf.active and not pf.match(ts, link, data):
+                    continue
+                q = quick_parse(link, data)
+                if q is None or q.proto != "tcp":
+                    continue
+                x, y = (q.src, q.sport), (q.dst, q.dport)
+                s = sel.get((x, y) if x <= y else (y, x))
+                if s is None:
+                    continue
+                seq, ack, flags, win, plen = q.tcp
+                fl = s["flow"]
+                d = fl.direction(q.src, q.sport)
+                marks = fl.update(ts, n, d, seq, ack, flags, win, plen, origlen)
+                if s["seq0"][d] is None:
+                    s["seq0"][d] = seq
+                rs = (seq - s["seq0"][d]) & MASK32
+                ra = ((ack - s["seq0"][1 - d]) & MASK32) if (flags & 0x10 and s["seq0"][1 - d] is not None) else None
+                if s["t0"] is None:
+                    s["t0"] = ts
+                if len(s["ev"]) < 4000:
+                    s["ev"].append((n, ts, d, flags, rs, ra, plen, win, tuple(marks)))
+                if plen and ts is not None and len(s["pts"]) < 4000:
+                    s["pts"].append((ts - s["t0"], d, rs + plen, "retransmission" in marks))
+    except (OSError, EOFError, CaptureError):
+        pass
+    traces = []
+    for i, k in enumerate(keys, 1):
+        s, fl = sel[k], a.tcp_flows[k]
+        ev = s["ev"]
+        if not ev:
+            continue
+        base = set(range(min(8, len(ev)))) | set(range(max(0, len(ev) - 3), len(ev)))
+        flagged = [j for j, e in enumerate(ev) if e[8] and j not in base]
+        order = sorted(base | set(flagged[:max(0, 30 - len(base))]))
+        ladder = []
+        for j in order:
+            e = ev[j]
+            m = e[8]
+            cls = "r" if ("retransmission" in m or "rst" in m) else "o" if ("dup-ack" in m or "out-of-order" in m) else "p" if "zero-window" in m else ""
+            ladder.append({"n": e[0], "t": _rel(e[1], s["t0"]), "d": e[2], "label": _pkt_label(e[3], e[4], e[5], e[6]),
+                           "cls": cls, "mark": ", ".join(m)})
+        t0 = s["t0"] or 0.0
+        tmax = max((e[1] for e in ev if e[1] is not None), default=t0)
+        span = max(tmax - t0, 1e-6)
+        nb = 60
+        bins = ([0] * nb, [0] * nb)
+        for e in ev:
+            if e[6] and e[1] is not None:
+                bins[e[2]][min(nb - 1, int((e[1] - t0) / span * nb))] += e[6]
+        c, sv = fl.ep
+        sni = " (%s)" % fl.sni if fl.sni else ""
+        stats = ("RTT %s, handshake %s, duration %.2f s, %d packets / %s, retransmissions %d, dup-ACKs %d, zero-window %d, out-of-order %d, ended: %s"
+                 % (fmt_ms(fl.rtt_ms), fmt_ms(fl.handshake_ms), fl.duration, sum(fl.pkts), human_bytes(sum(fl.bytes)),
+                    fl.retrans, fl.dupack, fl.zwin, fl.ooo, fl.end_state()))
+        traces.append({
+            "title": "Flow %d: %s → %s%s" % (i, fmt_ep(c), fmt_ep(sv), sni),
+            "client": fmt_ep(c), "server": fmt_ep(sv), "filter": flow_filter(c, sv), "stats_line": stats,
+            "stats": {"rtt_ms": fl.rtt_ms, "handshake_ms": fl.handshake_ms, "retransmissions": fl.retrans, "dup_acks": fl.dupack,
+                      "zero_window": fl.zwin, "out_of_order": fl.ooo, "end": fl.end_state(), "packets": sum(fl.pkts), "bytes": sum(fl.bytes)},
+            "extract": "pcap_analyzer.py %s --flow %s,%s --extract flow.pcap" % (shlex.quote(cmd_path), fmt_ep(c), fmt_ep(sv)),
+            "ladder": ladder, "omitted": max(0, len(ev) - len(ladder)),
+            "tput": (bins, t0, span / nb), "pts": s["pts"],
+        })
+    return traces
+
+
 # ------------------------------------------------------------------ main
+
+def parse_endpoint(s):
+    m = re.fullmatch(r"\[([0-9a-fA-F:.]+)\]:(\d+)", s.strip())
+    if m:
+        return m.group(1), int(m.group(2))
+    host, _, port = s.strip().rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError("bad endpoint '%s' (use IP:PORT or [IPv6]:PORT)" % s)
+    return host, int(port)
+
 
 def main():
     ap = argparse.ArgumentParser(description="Analyze a pcap/pcapng capture and print a text report "
@@ -1899,29 +3410,67 @@ def main():
     ap.add_argument("-n", "--top", type=int, default=10, help="rows per top-list (default 10)")
     ap.add_argument("--json", action="store_true", help="print JSON instead of text")
     ap.add_argument("--html", metavar="FILE", help="also write a self-contained HTML report with charts")
-    ap.add_argument("-q", "--quiet", action="store_true", help="with --html/-o: do not print the report to the terminal")
+    ap.add_argument("-q", "--quiet", action="store_true", help="with --html/-o/--extract: do not print the report to the terminal")
     ap.add_argument("-o", "--output", help="write the plain-text report to this file as well")
     ap.add_argument("--whois", action="store_true",
                     help="look up ASN/organisation/country of the public IPs (sends them to whois.cymru.com)")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="colors in terminal output (default auto; NO_COLOR is respected)")
+    g = ap.add_argument_group("filters (applied while reading; packet numbers stay those of the original file)")
+    g.add_argument("--host", action="append", default=[], metavar="IP", help="only packets to/from this IP (repeatable)")
+    g.add_argument("--port", action="append", type=int, default=[], metavar="N", help="only TCP/UDP packets using this port (repeatable)")
+    g.add_argument("--proto", action="append", default=[], metavar="P", help="only tcp, udp, icmp, icmpv6 or arp (repeatable)")
+    g.add_argument("--flow", action="append", default=[], metavar="A,B",
+                   help="only one conversation: IP:PORT,IP:PORT or [IPv6]:PORT,... (repeatable)")
+    g.add_argument("--from", dest="t_from", metavar="TIME", help="start of window: +SECONDS after the first packet, HH:MM:SS or 'YYYY-MM-DD HH:MM:SS' (UTC)")
+    g.add_argument("--to", dest="t_to", metavar="TIME", help="end of window (same formats as --from)")
+    ap.add_argument("--extract", metavar="FILE", help="write the packets that pass the filters to a new pcap (open it in Wireshark)")
+    ap.add_argument("--no-trace", action="store_true", help="skip the flow-trace pass (it reads the capture a second time)")
     args = ap.parse_args()
 
+    try:
+        flows = []
+        for spec in args.flow:
+            parts = spec.split(",")
+            if len(parts) != 2:
+                raise ValueError("bad --flow '%s' (use IP:PORT,IP:PORT)" % spec)
+            flows.append((parse_endpoint(parts[0]), parse_endpoint(parts[1])))
+        pf_kwargs = dict(hosts=args.host, ports=args.port, protos=args.proto, flows=flows,
+                         t_from=PacketFilter.parse_time(args.t_from, None), t_to=PacketFilter.parse_time(args.t_to, None))
+    except ValueError as e:
+        sys.exit("error: %s" % e)
+    pf = PacketFilter(**pf_kwargs)
+    if args.extract and not pf.active:
+        sys.exit("error: --extract needs at least one filter (--host/--port/--proto/--flow/--from/--to)")
+
     a = Analyzer()
+    writer = None
     try:
         fh = open_capture(args.pcap)
     except OSError as e:
         sys.exit("error: %s" % e)
     try:
         with fh:
+            n = 0
             for pkt in iter_packets(fh, a.meta):
-                a.add(*pkt)
+                n += 1
+                if pf.active and not pf.match(pkt[0], pkt[3], pkt[4]):
+                    continue
+                if args.extract:
+                    if writer is None:
+                        writer = PcapWriter(args.extract, pkt[3])
+                    writer.write(*pkt)
+                a.add(*pkt, n=n)
     except CaptureError as e:
         sys.exit("error: %s" % e)
     except (EOFError, OSError) as e:
         a.meta["warning"] = "read error: %s" % e
+    if writer:
+        writer.close()
+        print("%d packets written to %s%s" % (writer.n, args.extract, " (%d skipped: different link type)" % writer.skipped if writer.skipped else ""),
+              file=sys.stderr)
     if a.pkts == 0:
-        sys.exit("error: no packets found in %s" % args.pcap)
+        sys.exit("error: no packets %s in %s" % ("match the filter" if pf.active else "found", args.pcap))
 
     who = None
     if args.whois:
@@ -1931,25 +3480,26 @@ def main():
             who = cymru_whois(ranked)
         except OSError as e:
             print("warning: whois lookup failed (%s); continuing without it" % e, file=sys.stderr)
-    rep = build_report(a, args.pcap, max(1, args.top), who)
+    traces = None if args.no_trace else build_traces(args.pcap, a, pf_kwargs, pick_flows(a), args.pcap)
+    rep = build_report(a, args.pcap, max(1, args.top), who, traces, pf.describe() if pf.active else None)
     if args.html:
-        with open(args.html, "w", encoding="utf-8") as f:
-            f.write(rep.to_html())
+        with open(args.html, "w", encoding="utf-8") as fo:
+            fo.write(rep.to_html())
         print("HTML report written to %s" % args.html, file=sys.stderr)
     tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
     color = args.color == "always" or (args.color == "auto" and tty)
-    width = max(80, min(120, shutil.get_terminal_size((100, 24)).columns)) if sys.stdout.isatty() else 100
+    width = max(80, min(150, shutil.get_terminal_size((100, 24)).columns)) if sys.stdout.isatty() else 130
     if args.json:
         text = json.dumps(rep.to_json(), indent=2, default=str) + "\n"
         shown = text
     else:
         text = rep.to_text(Style(False), width)
         shown = rep.to_text(Style(True), width) if color else text
-    if not (args.quiet and (args.html or args.output)):
+    if not (args.quiet and (args.html or args.output or args.extract)):
         sys.stdout.write(shown)
     if args.output:
-        with open(args.output, "w") as f:
-            f.write(text)
+        with open(args.output, "w") as fo:
+            fo.write(text)
 
 
 if __name__ == "__main__":

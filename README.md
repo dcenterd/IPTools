@@ -19,11 +19,12 @@ Most scripts query public data sources ([RIPEstat](https://stat.ripe.net), the R
 | `ssl_checker.py` | Checks the SSL/TLS certificate of one or many websites: expiry, invalid/self-signed/wrong-host certificates, missing intermediate (incomplete chain) and DNS failures. Shows a table with issuer and days left, can alert by webhook or e-mail, run on a schedule in the background, and dump certificates as PEM plus decoded text. |
 | `cve_checker.py` | Latest published CVEs from NVD and CIRCL, ranked by real-world risk: CISA KEV (exploited now) first, then EPSS exploitation probability, then CVSS score. Filter by days, keyword, severity or score; table or JSON output. |
 | `ipx.py` | All-in-one network diagnostics (Linux, no root needed): traceroute over ICMP, UDP or TCP, with per-hop ASN/org/country (`--asn`), path MTU discovery (`--mtu`), protocol/host comparison (`--compare`), live per-hop stats with sparklines (`--live`), ping with stats (`--ping`) and TCP/UDP port scan (`--scan`, `--open`). Uses only the standard library. A single-binary Go port lives in [`ipx-go/`](ipx-go/) (prebuilt Linux amd64/arm64 on the [Releases](https://github.com/dcenterd/IPTools/releases) page). |
+| `pcap_analyzer.py` | Text report for a packet capture (`.pcap`, `.pcapng`, `.gz`; standard library only): top senders/receivers/conversations, protocol hierarchy, then layer by layer: capture/link info, Ethernet/VLAN/ARP, IP/ICMP, TCP/UDP ports, flags, handshakes and retransmissions, TLS (versions, SNI, ALPN), and DNS/HTTP/DHCP details, plus heuristic findings (port scans, cleartext credentials, ARP conflicts, old TLS). `--json`, `-n` for list length, `-o` to save. |
 
 ## Requirements
 
 - Python 3.8+
-- `requests` (all scripts except `ripe_ip_checker.py`, `ssl_checker.py` and `cve_checker.py`, which use only the standard library)
+- `requests` (all scripts except `ripe_ip_checker.py`, `ssl_checker.py`, `cve_checker.py` and `pcap_analyzer.py`, which use only the standard library)
 
 ```sh
 git clone https://github.com/dcenterd/IPTools.git
@@ -64,6 +65,9 @@ pip install -r requirements.txt
 ./ssl_checker.py github.com example.org:8443
 ./ssl_checker.py -f sites.txt --warn-days 30 --dump-cert certs
 ./ssl_checker.py -f sites.txt --every 6h --background --webhook <url>
+
+# analyze a capture (top IPs, protocols, layers 1-7, findings)
+./pcap_analyzer.py capture.pcap -n 15 -o report.txt
 
 # newest CVEs, riskiest first
 ./cve_checker.py --days 7 --severity high

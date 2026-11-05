@@ -110,6 +110,30 @@ Set these environment variables to enable extra reputation and compliance checks
 
 `ABUSEIPDB_API_KEY`, `IPQS_API_KEY`, `OTX_API_KEY`, `GREYNOISE_API_KEY`, `IPINFO_TOKEN`, `SHODAN_API_KEY`, `SPAMHAUS_DQS_KEY`, `OPENSANCTIONS_API_KEY`
 
+## pcap_analyzer.py flags
+
+`./pcap_analyzer.py capture.pcap [options]`
+
+| Flag | Description |
+|---|---|
+| `-n`, `--top N` | Rows per top-list (default 10). |
+| `--json` | Print JSON instead of text. |
+| `--html FILE` | Also write a self-contained HTML report with charts. |
+| `-o`, `--output FILE` | Write the plain-text report to this file as well. |
+| `-q`, `--quiet` | With `--html`/`-o`/`--extract`: do not print the report to the terminal. |
+| `--whois` | Look up ASN/org/country of public IPs (sends them to whois.cymru.com). |
+| `--color WHEN` | `auto` (default), `always` or `never`; `NO_COLOR` is respected. |
+| `--no-trace` | Skip the flow-trace pass (it reads the capture a second time). |
+| `--host IP` | Only packets to/from this IP (repeatable). |
+| `--port N` | Only TCP/UDP packets using this port (repeatable). |
+| `--proto P` | Only `tcp`, `udp`, `icmp`, `icmpv6` or `arp` (repeatable). |
+| `--flow A,B` | Only one conversation: `IP:PORT,IP:PORT` or `[IPv6]:PORT,...` (repeatable). |
+| `--from TIME` | Start of window: `+SECONDS` after the first packet, `HH:MM:SS` or `'YYYY-MM-DD HH:MM:SS'` (UTC). |
+| `--to TIME` | End of window (same formats as `--from`). |
+| `--extract FILE` | Write the packets that pass the filters to a new pcap (open it in Wireshark). |
+
+Filters are applied while reading; packet numbers stay those of the original file.
+
 ## Notes
 
 - Country lists show where address space is *registered*, which is not always where it is used or geolocated.

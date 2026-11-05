@@ -1,6 +1,6 @@
 # ipx (Go)
 
-Single static binary version of [`ipx.py`](../ipx.py): traceroute over ICMP/UDP with per-hop ASN, path MTU discovery, protocol/host comparison, live per-hop stats (`q` to quit), ping, an nc-style TCP/UDP port check (`--port`) and port scan. `-o FILE` saves a plain-text copy of the results. Linux only, no root needed, no runtime dependencies except the system `ping` command.
+Single static binary version of [`ipx.py`](../ipx.py): traceroute over ICMP/UDP with per-hop ASN, path MTU discovery, protocol/host comparison, live per-hop stats (`q` to quit), ping, an nc-style TCP/UDP port check (`--port`), an `nc -l` style TCP listener (`-l PORT`) and port scan. `-o FILE` saves a plain-text copy of the results. Linux only, no root needed, no runtime dependencies except the system `ping` command.
 
 ## Install
 
@@ -21,6 +21,7 @@ ipx 8.8.8.8 --asn                      # trace with ASN/org/country per hop
 ipx example.org --mtu                  # ICMP trace, then path MTU
 ipx example.org --port 443             # nc-style check of TCP and UDP 443
 ipx example.org --port 53 -U           # UDP only (-T for TCP only)
+ipx -l 8080                            # listen on TCP 8080 like nc -l (--bind ADDR to choose the address)
 ipx 8.8.8.8 1.1.1.1 --compare          # compare hosts
 ipx 8.8.8.8 --compare --protos icmp,udp
 ipx 8.8.8.8 --live                     # live per-hop stats

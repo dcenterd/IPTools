@@ -22,7 +22,8 @@ type Args struct {
 	Hosts                          []string
 	MaxHops, Probes, Timeout, Port int
 	Proto, Protos, Scan, ScanProto string
-	Output                         string
+	Output, Bind                   string
+	Listen                         int
 	PortSet, Tcp                   bool
 	ASN, MTU, Compare, Live, Ping  bool
 	Open, ShowClosed, NoDNS        bool
@@ -36,6 +37,7 @@ const helpText = `usage: ipx [-h] [-m MAX_HOPS] [-q PROBES] [-w TIMEOUT] [-P {ic
            [--ping] [-c PING_COUNT] [--scan [PORTS]] [--scan-proto PROTO]
            [--open] [--show-closed] [-o FILE] [-n] [--version]
            host [host ...]
+       ipx -l PORT [--bind ADDR]
 
 Network diagnostics: traceroute (ICMP/UDP) with per-hop ASN, ping, path MTU,
 protocol comparison, live hop stats and TCP/UDP port check/scan. Linux, no root.
@@ -74,6 +76,9 @@ options:
   --show-closed         scan: also list closed/filtered ports
   -o, --output FILE     also save the results as plain text (no colors) to
                         FILE; the live view saves its final summary
+  -l, --listen PORT     listen on this TCP port like nc -l: accept one
+                        connection, then relay stdin/stdout (no host needed)
+  --bind ADDR           listen: address to bind (default 0.0.0.0)
   -n, --no-dns          skip reverse DNS
   --version             print version
 `
@@ -101,7 +106,7 @@ type option struct {
 var scanValRE = regexp.MustCompile(`^(top|[0-9][0-9,\-]*)$`)
 
 func parseArgs(argv []string) *Args {
-	a := &Args{MaxHops: 30, Probes: 3, Timeout: 1, Port: 443, Protos: "icmp,udp",
+	a := &Args{MaxHops: 30, Probes: 3, Timeout: 1, Port: 443, Protos: "icmp,udp", Bind: "0.0.0.0",
 		Interval: 1, PingCount: 5}
 	atoi := func(name string, v string) int {
 		n, err := strconv.Atoi(v)
@@ -123,6 +128,8 @@ func parseArgs(argv []string) *Args {
 		{"U", "udp", kBool, func(a *Args, _ string) { a.Proto = "udp" }},
 		{"T", "tcp", kBool, func(a *Args, _ string) { a.Tcp = true }},
 		{"", "port", kValue, func(a *Args, v string) { a.Port, a.PortSet = atoi("--port", v), true }},
+		{"l", "listen", kValue, func(a *Args, v string) { a.Listen = atoi("-l/--listen", v) }},
+		{"", "bind", kValue, func(a *Args, v string) { a.Bind = v }},
 		{"o", "output", kValue, func(a *Args, v string) { a.Output = v }},
 		{"a", "asn", kBool, func(a *Args, _ string) { a.ASN = true }},
 		{"", "mtu", kBool, func(a *Args, _ string) { a.MTU = true }},
@@ -225,6 +232,12 @@ func parseArgs(argv []string) *Args {
 			a.Hosts = append(a.Hosts, arg)
 		}
 	}
+	if a.Listen != 0 {
+		if a.Listen < 1 || a.Listen > 65535 {
+			usageErr("--listen port must be 1-65535")
+		}
+		return a
+	}
 	if len(a.Hosts) == 0 {
 		usageErr("the following arguments are required: host")
 	}
@@ -311,6 +324,9 @@ func run() int {
 		os.Exit(130) // second Ctrl+C: stop immediately
 	}()
 
+	if a.Listen != 0 {
+		return runListen(a.Bind, a.Listen)
+	}
 	udpSel := a.Proto == "udp"
 	checkProtos := []string{"udp"}
 	switch {

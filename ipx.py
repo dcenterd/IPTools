@@ -13,11 +13,13 @@ Extras:
   --ping     ICMP ping with stats, instead of tracing
   --port N   nc-style check of one TCP and/or UDP port (-T / -U pick one), instead of tracing
   --scan     TCP/UDP port scan (many ports), instead of tracing
+  -l PORT    listen on a TCP port like `nc -l` (no host needed; stdin <-> connection)
   --open     find open ports on both TCP and UDP (confirmed-open only)
 
 Usage: ipx.py <host> [host ...] [-P icmp|udp | -U]  |  --port N [-T] [-U]
                      [--asn] [--mtu] [--compare [--protos icmp,udp]] [--live]
                      [--ping [-c N]] [--scan [PORTS] [--scan-proto tcp,udp] | --open]
+       ipx.py -l PORT [--bind ADDR]
 """
 import sys
 
@@ -799,9 +801,57 @@ class Tee:
         return getattr(self.out, name)
 
 
+def run_listen(bind, port):
+    """nc -l: accept one TCP connection, then relay stdin -> peer and peer -> stdout."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        srv.bind((bind, port))
+        srv.listen(1)
+    except OSError as e:
+        hint = " (ports below 1024 need root)" if e.errno == errno.EACCES else ""
+        sys.exit(f"error: cannot listen on {bind}:{port}: {e.strerror}{hint}")
+    err = lambda m: print(m, file=sys.stderr, flush=True)
+    err(f"{BOLD}{CYAN}Listening{RESET} on {MAGENTA}{bind}{RESET}:{YELLOW}{port}{RESET}/tcp  {DIM}Ctrl+C to quit{RESET}")
+    try:
+        conn, peer = srv.accept()
+    except KeyboardInterrupt:
+        err(f"\n{YELLOW}Interrupted.{RESET}")
+        return 130
+    finally:
+        srv.close()
+    err(f"{GREEN}Connection from{RESET} {MAGENTA}{peer[0]}{RESET}:{peer[1]}")
+    stdin_fd, stdout = sys.stdin.fileno(), sys.stdout.buffer
+    watch, sent, recvd = [conn, stdin_fd], 0, 0
+    try:
+        while conn in watch:
+            ready, _, _ = select.select(watch, [], [])
+            if conn in ready:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                stdout.write(data)
+                stdout.flush()
+                recvd += len(data)
+            if stdin_fd in ready:
+                data = os.read(stdin_fd, 65536)
+                if not data:            # stdin closed: stop sending, keep receiving
+                    watch.remove(stdin_fd)
+                    conn.shutdown(socket.SHUT_WR)
+                else:
+                    conn.sendall(data)
+                    sent += len(data)
+    except (KeyboardInterrupt, BrokenPipeError, ConnectionError):
+        pass
+    finally:
+        conn.close()
+    err(f"{DIM}Connection closed ({sent} bytes sent, {recvd} bytes received){RESET}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Network diagnostics: traceroute (ICMP/UDP) with per-hop ASN, ping, path MTU, protocol comparison, live hop stats TCP/UDP port check/scan. Linux, no root.")
-    ap.add_argument("hosts", nargs="+", metavar="host")
+    ap.add_argument("hosts", nargs="*", metavar="host")
     ap.add_argument("-m", "--max-hops", type=int, default=30)
     ap.add_argument("-q", "--probes", type=int, default=3)
     ap.add_argument("-w", "--timeout", type=int, default=1, help="per-probe timeout (s)")
@@ -835,8 +885,17 @@ def main():
     ap.add_argument("--show-closed", action="store_true", help="scan: also list closed/filtered ports")
     ap.add_argument("-o", "--output", metavar="FILE",
                     help="also save the results as plain text (no colors) to FILE; the live view saves its final summary")
+    ap.add_argument("-l", "--listen", type=int, metavar="PORT",
+                    help="listen on this TCP port like `nc -l`: accept one connection, then relay stdin/stdout (no host needed)")
+    ap.add_argument("--bind", default="0.0.0.0", metavar="ADDR", help="listen: address to bind (default 0.0.0.0)")
     ap.add_argument("-n", "--no-dns", action="store_true", help="skip reverse DNS")
     args = ap.parse_args()
+    if args.listen is not None:
+        if not 1 <= args.listen <= 65535:
+            ap.error("--listen port must be 1-65535")
+        return run_listen(args.bind, args.listen)
+    if not args.hosts:
+        ap.error("the following arguments are required: host")
     if args.tcp and args.port is None:
         ap.error("-T only applies to a port check: use --port N (for a port scan use --scan-proto)")
     if args.port is not None and not 1 <= args.port <= 65535:

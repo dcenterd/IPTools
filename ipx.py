@@ -10,7 +10,7 @@ Extras:
   --mtu      path MTU discovery (DF pings, binary search)
   --compare  compare ICMP/UDP paths to one host, or several hosts side by side
   --live     keep probing every hop and show live stats + sparklines
-  --ping     ICMP ping with stats, instead of tracing
+  --ping     ICMP ping with stats, instead of tracing; with --port N a TCP port ping
   --port N   nc-style check of one TCP and/or UDP port (-T / -U pick one), instead of tracing
   --scan     TCP/UDP port scan (many ports), instead of tracing
   -l PORT    listen on a TCP port like `nc -l` (no host needed; stdin <-> connection)
@@ -18,7 +18,7 @@ Extras:
 
 Usage: ipx.py <host> [host ...] [-P icmp|udp | -U]  |  --port N [-T] [-U]
                      [--asn] [--mtu] [--compare [--protos icmp,udp]] [--live]
-                     [--ping [-c N]] [--scan [PORTS] [--scan-proto tcp,udp] | --open]
+                     [--ping [-c N] [--port N]] [--scan [PORTS] [--scan-proto tcp,udp] | --open]
        ipx.py -l PORT [--bind ADDR]
 """
 import sys
@@ -521,21 +521,37 @@ def ping_icmp(target, timeout):
 
 
 def run_ping(args, target):
-    """ICMP ping; live lines + bottom bar."""
-    kind = "ICMP"
+    """ICMP ping, or with --port a TCP port ping (connect RTT); live lines + bottom bar."""
+    tcp = args.port is not None
+    if tcp and args.proto == "udp":
+        sys.exit("error: a port ping is TCP only (UDP has no handshake to time); drop -U")
+    kind = f"TCP:{args.port}" if tcp else "ICMP"
     w = bar_width()
     print(f"{BOLD}{CYAN}Ping{RESET} {MAGENTA}{target}{RESET} via {YELLOW}{kind}{RESET}, "
           f"{args.ping_count} probes\n")
-    rtts, sent = [], 0
+    rtts, sent, refused = [], 0, 0
     sys.stdout.write(bar(0, args.ping_count, w, "Pinging"))
     try:
         for seq in range(1, args.ping_count + 1):
             t0 = time.monotonic()
-            rtt = ping_icmp(target, args.timeout)
+            state = "open"
+            if tcp:
+                state, rtt = scan_tcp(target, args.port, args.timeout)
+                if state == "filtered":
+                    rtt = None
+            else:
+                rtt = ping_icmp(target, args.timeout)
             sent += 1
             rtts.append(rtt)
-            res = (f"{GREEN}reply{RESET} from {MAGENTA}{target}{RESET}  time {rtt_color(rtt)}{rtt:7.1f} ms{RESET}"
-                   if rtt is not None else f"{RED}timeout{RESET}")
+            if rtt is None:
+                res = f"{RED}timeout{RESET}"
+            elif state == "closed":     # RST: the host answered, the port is closed
+                refused += 1
+                res = (f"{YELLOW}port closed (RST){RESET} from {MAGENTA}{target}:{args.port}{RESET}  "
+                       f"time {rtt_color(rtt)}{rtt:7.1f} ms{RESET}")
+            else:
+                at = f"{target}:{args.port}" if tcp else target
+                res = f"{GREEN}reply{RESET} from {MAGENTA}{at}{RESET}  time {rtt_color(rtt)}{rtt:7.1f} ms{RESET}"
             sys.stdout.write("\r\033[K" + f"{DIM}seq {seq:>3}{RESET}  {res}\n"
                              + bar(seq, args.ping_count, w, "Pinging"))
             sys.stdout.flush()
@@ -549,12 +565,28 @@ def run_ping(args, target):
     lc = GREEN if loss == 0 else YELLOW if loss < 20 else RED
     print(f"{BOLD}--- {target} ping statistics ---{RESET}")
     print(f"{sent} sent, {len(ok)} received, {lc}{loss:.1f}% loss{RESET}")
+    if refused:
+        print(f"{YELLOW}{refused} of the replies were RST: the host is up but TCP port {args.port} is closed{RESET}")
     if ok:
         avg = sum(ok) / len(ok)
         jitter = math.sqrt(sum((x - avg) ** 2 for x in ok) / len(ok))
         print(f"min {rtt_color(min(ok))}{min(ok):.1f}{RESET} / avg {rtt_color(avg)}{avg:.1f}{RESET} / "
               f"max {rtt_color(max(ok))}{max(ok):.1f}{RESET} / jitter {jitter:.1f} ms")
         print(sparkline(rtts, min(len(rtts), 60)))
+    n_open = len(ok) - refused
+    if tcp:     # one clear verdict for the port
+        at = f"{target}:{args.port}/tcp"
+        if sent and n_open == sent:
+            print(f"\n{GREEN}{BOLD}\u2714 Port ping OK:{RESET} {MAGENTA}{at}{RESET} is open ({n_open}/{sent} replies)")
+        elif n_open:
+            print(f"\n{YELLOW}{BOLD}! Port ping partly OK:{RESET} {MAGENTA}{at}{RESET} is open but only "
+                  f"{n_open}/{sent} probes were answered")
+        elif refused:
+            print(f"\n{YELLOW}{BOLD}! Host is up, port closed:{RESET} {MAGENTA}{at}{RESET} refused the connection")
+        else:
+            print(f"\n{RED}{BOLD}\u2718 Port ping FAILED:{RESET} no answer from {MAGENTA}{at}{RESET} "
+                  f"(filtered, host down or wrong port)")
+    return 0 if ok and (not tcp or n_open) else 1
 
 
 # --------------------------------------------------------------------------- port scan
@@ -873,7 +905,7 @@ def main():
     ap.add_argument("--interval", type=float, default=1.0, help="live mode: seconds between rounds")
     ap.add_argument("--count", type=int, default=0, help="live mode: stop after N rounds (0 = forever)")
     ap.add_argument("--ping", action="store_true",
-                    help="ping the host (ICMP, or TCP connects with -T) instead of tracing")
+                    help="ping the host instead of tracing: ICMP, or a TCP port ping when combined with --port")
     ap.add_argument("-c", "--ping-count", type=int, default=5, help="ping: number of probes (default 5)")
     ap.add_argument("--scan", nargs="?", const="top", metavar="PORTS",
                     help="port check instead of tracing: 'top' (default), or e.g. 22,80,8000-8100")
@@ -906,7 +938,7 @@ def main():
         args.proto = "icmp"
 
     port_only = args.port is not None or args.scan or args.open or args.scan_proto or args.show_closed
-    needs_ping = (args.ping or args.mtu
+    needs_ping = ((args.ping and args.port is None) or args.mtu
                   or (args.compare and (len(args.hosts) > 1 and args.proto != "udp" or "icmp" in args.protos))
                   or (not port_only and not args.compare and args.proto != "udp"))
     check_prereqs(needs_ping)
@@ -929,13 +961,13 @@ def main():
                 sys.exit("error: --ping/--scan/--port take a single host")
             rc = 0
             if args.ping:
-                run_ping(args, targets[0][1])
+                rc = run_ping(args, targets[0][1])
             if args.scan:
                 if args.ping:
                     print()
                 run_scan(args, targets[0][1])
-            if args.port is not None:
-                if args.ping or args.scan:
+            if args.port is not None and not args.ping:   # with --ping, --port is the ping target
+                if args.scan:
                     print()
                 rc = run_check(args, targets[0][1], check_protos)
             return rc

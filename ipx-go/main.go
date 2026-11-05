@@ -64,7 +64,8 @@ options:
   --live                keep probing every hop and draw live stats (q to quit)
   --interval INTERVAL   live/ping: seconds between rounds (default 1)
   --count COUNT         live mode: stop after N rounds (0 = forever)
-  --ping                ICMP ping the host instead of tracing
+  --ping                ping the host instead of tracing: ICMP, or a TCP port
+                        ping when combined with --port
   -c, --ping-count N    ping: number of probes (default 5)
   --scan [PORTS]        port scan instead of tracing: 'top' (default), or
                         e.g. 22,80,8000-8100
@@ -339,7 +340,7 @@ func run() int {
 		a.Proto = "icmp"
 	}
 	portOnly := a.PortSet || a.Scan != "" || a.Open || a.ScanProto != "" || a.ShowClosed
-	needsPing := a.Ping || a.MTU ||
+	needsPing := (a.Ping && !a.PortSet) || a.MTU ||
 		(a.Compare && ((len(a.Hosts) > 1 && a.Proto != "udp") || strings.Contains(a.Protos, "icmp"))) ||
 		(!portOnly && !a.Compare && a.Proto != "udp")
 	checkPrereqs(needsPing)
@@ -372,7 +373,7 @@ func run() int {
 		}
 		rc := 0
 		if a.Ping {
-			runPingCmd(a, targets[0][1])
+			rc = runPingCmd(a, targets[0][1])
 		}
 		if a.Scan != "" && !intr.Load() {
 			if a.Ping {
@@ -380,8 +381,8 @@ func run() int {
 			}
 			runScan(a, targets[0][1])
 		}
-		if a.PortSet && !intr.Load() {
-			if a.Ping || a.Scan != "" {
+		if a.PortSet && !a.Ping && !intr.Load() { // with --ping, --port is the ping target
+			if a.Scan != "" {
 				outln("")
 			}
 			rc = runCheck(a, targets[0][1], checkProtos)

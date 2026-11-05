@@ -343,6 +343,12 @@ class Analyzer:
         self.cleartext = Counter()               # protocol -> packets with credentials-like data
         self.cleartext_hosts = defaultdict(set)
         self.quic = 0
+        self._pair = None
+        self.ip_stacks = defaultdict(Counter)    # ip -> {leaf protocol: packets}
+        self.ip_services = defaultdict(Counter)  # server ip -> {"443/tcp": connection attempts}
+        self.ip_sni = defaultdict(Counter)       # server ip -> TLS server names asked for
+        self.ip_http = defaultdict(Counter)      # server ip -> HTTP Host headers
+        self.ip_dnsq = defaultdict(Counter)      # client ip -> DNS names it queried
         self.ssdp = Counter()
         self.ntp = 0
 
@@ -361,10 +367,15 @@ class Analyzer:
             self.per_second[int(ts)] += origlen
         self.sizes.append(origlen)
         stack = ["link%d" % link]
+        self._pair = None
         try:
             self.decode_link(link, data, origlen, stack)
         except (struct.error, IndexError, ValueError):
             self.malformed["truncated/malformed packet"] += 1
+        if self._pair:
+            leaf = stack[-1].upper()
+            for ip in set(self._pair):
+                self.ip_stacks[ip][leaf] += 1
         name = ":".join(stack)
         self.stack_pkts[name] += 1
         self.stack_bytes[name] += origlen
@@ -451,6 +462,7 @@ class Analyzer:
 
     # ---- L3
     def count_ip(self, src, dst, length, ver, stack):
+        self._pair = (src, dst)
         self.ip_ver[ver] += 1
         self.ip_tx_p[src] += 1
         self.ip_tx_b[src] += length
@@ -551,6 +563,7 @@ class Analyzer:
             st[0] += 1
             self.syn_targets[src].add((dst, dport))
             self.tcp_dport[dport] += 1
+            self.ip_services[dst]["%d/tcp" % dport] += 1
             self.tcp_dport_b[dport] += origlen
         elif syn and ackf:
             st[1] += 1
@@ -594,6 +607,8 @@ class Analyzer:
         key = (a, b) if a <= b else (b, a)
         self.flow_update(key, origlen, None, "udp")
         self.udp_dport[dport] += 1
+        if dport in SERVICES or dport < 1024:
+            self.ip_services[dst]["%d/udp" % dport] += 1
         self.udp_dport_b[dport] += origlen
         payload = p[8:]
         if payload:
@@ -710,6 +725,7 @@ class Analyzer:
             self.tls_old[("client offers at most " if hs == 1 else "server selected ") + label] += 1
         if sni:
             self.tls_sni[sni] += 1
+            self.ip_sni[dst][sni] += 1
 
     def decode_http(self, src, dst, d, stack):
         stack.append("http")
@@ -731,6 +747,7 @@ class Analyzer:
             self.http_methods[first.split(b" ")[0].decode("latin-1")] += 1
             if b"host" in hdrs:
                 self.http_hosts[printable(hdrs[b"host"], 60)] += 1
+                self.ip_http[dst][printable(hdrs[b"host"], 60)] += 1
             if b"user-agent" in hdrs:
                 self.http_ua[printable(hdrs[b"user-agent"], 70)] += 1
             if b"authorization" in hdrs:
@@ -795,6 +812,7 @@ class Analyzer:
             if qname is not None:
                 if not qr:
                     self.dns_q[qname.lower()] += 1
+                    self.ip_dnsq[src][qname.lower()] += 1
                     self.dns_qtype[DNS_TYPES.get(qtype, str(qtype))] += 1
                     if len(qname) > 60 or max((len(x) for x in qname.split(".")), default=0) > 40:
                         self.dns_long.append(qname)
@@ -1002,6 +1020,11 @@ class Report:
             sec["items"].append({"t": "donut", "title": title, "pairs": pairs})
 
     @staticmethod
+    def hosts(sec, hosts):
+        if hosts:
+            sec["items"].append({"t": "hosts", "hosts": hosts})
+
+    @staticmethod
     def graph(sec, nodes, edges, hubs):
         if len(nodes) >= 2:
             sec["items"].append({"t": "graph", "nodes": nodes, "edges": edges, "hubs": hubs})
@@ -1033,6 +1056,8 @@ class Report:
                     out += self._timeline_text(st, it["per_second"], width)
                 elif t == "graph":
                     out += self._graph_text(st, it, width)
+                elif t == "hosts":
+                    out += self._hosts_text(st, it["hosts"], width)
         return "\n".join(out).lstrip("\n") + "\n"
 
     @staticmethod
@@ -1103,6 +1128,13 @@ class Report:
         return out
 
     @staticmethod
+    def _hosts_text(st, hosts, width):
+        rows = [[h["ip"], h["cls"], h["org"] or "-", "{:,}".format(h["tx_pkts"] + h["rx_pkts"]),
+                 human_bytes(h["tx_bytes"] + h["rx_bytes"]), ", ".join(s for s, _ in h["services"][:3]) or "-"] for h in hosts]
+        return Report._table_text(st, {"title": "Host profiles (open the HTML report for full per-host cards)",
+                                       "headers": ["IP", "Class", "Network", "Packets", "Bytes", "Services"], "rows": rows}, width)
+
+    @staticmethod
     def _graph_text(st, it, width):
         out = ["", "  " + st("bold", "Talker map") + st("dim", "  (busiest hosts and their biggest peers)")]
         bw = 14
@@ -1137,6 +1169,8 @@ class Report:
                 elif t == "timeline":
                     bins, lo, hi, bs = bin_series(it["per_second"], 60)
                     sec["timeline"] = {"start": lo, "end": hi, "seconds_per_bin": bs, "bytes": bins}
+                elif t == "hosts":
+                    sec["hosts"] = it["hosts"]
                 elif t == "graph":
                     sec["graph"] = {"nodes": it["nodes"], "edges": [
                         {"a": a, "b": b, "bytes": by, "packets": pk} for a, b, by, pk in it["edges"]]}
@@ -1204,6 +1238,15 @@ td.txt{max-width:340px;overflow:hidden;text-overflow:ellipsis}
 .chart text{fill:var(--mute);font-size:11px}
 .chart .lbl{fill:var(--ink);stroke:var(--card);stroke-width:3px;paint-order:stroke}
 section>h3{margin-top:14px}
+section,.host{scroll-margin-top:56px}
+a.ip{color:var(--c1);text-decoration:none;border-bottom:1px dotted var(--c1)}a.ip:hover{border-bottom-style:solid}
+.hostlist{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}
+.host{border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.host:target{outline:2px solid var(--c1);outline-offset:2px;background:color-mix(in srgb,var(--c1) 6%,var(--card))}
+.hhead{display:flex;justify-content:space-between;align-items:baseline}.hhead h3{font-size:15px;color:var(--ink);margin:0 0 6px}
+a.back{font-size:12px;color:var(--mute);text-decoration:none}a.back:hover{color:var(--ink)}
+.minis{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:8px}
+.mini{min-width:0}.mini table{table-layout:auto}.mini td,.mini td.txt{padding:2px 6px;white-space:normal;word-break:break-word;max-width:none}.mini h3{margin:0 0 2px}
 .donuts{display:flex;flex-wrap:wrap;gap:24px;margin-bottom:10px}
 .donut{display:flex;gap:16px;align-items:center}
 .donut svg{width:150px;height:150px;flex:none}
@@ -1245,6 +1288,36 @@ def _e(x):
     return html.escape(str(x), quote=True)
 
 
+LINKABLE = set()                      # IPs that have a host card; set by render_html
+IP_RE = re.compile(r"(?<![\w.:])((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]*:[0-9a-fA-F:]+)(?![\w.:])")
+
+
+def host_id(ip):
+    return "host-" + re.sub(r"[^a-z0-9]+", "-", ip.lower()).strip("-")
+
+
+def linkify(text):
+    """Escape text; IPs that have a host card become links to it."""
+    out, last = [], 0
+    for m in IP_RE.finditer(text):
+        ip = m.group(1)
+        if ip in LINKABLE:
+            out.append(_e(text[last:m.start()]))
+            out.append('<a class="ip" href="#%s">%s</a>' % (host_id(ip), _e(ip)))
+            last = m.end()
+    out.append(_e(text[last:]))
+    return "".join(out)
+
+
+def linkify_cell(text):
+    """Table cells: 'ip', 'ip  (name)', 'ip:port' or '[v6]:port' - link the address part only."""
+    m = re.match(r"^\[?([0-9a-fA-F:.]+)\]?(?=$|:\d+$|\s)", text)
+    if m and m.group(1) in LINKABLE:
+        s, e = m.span(1)
+        return _e(text[:s]) + '<a class="ip" href="#%s">%s</a>' % (host_id(m.group(1)), _e(m.group(1))) + _e(text[e:])
+    return _e(text)
+
+
 def _html_table(it):
     headers, rows = it["headers"], it["rows"]
     bi = bar_col(headers)
@@ -1262,7 +1335,7 @@ def _html_table(it):
                 out.append('<td class="num"%s><div class="bar"><i style="width:%.1f%%"></i><span>%s</span></div></td>'
                            % (dv, min(100.0, pct_value(c) * 100), _e(c)))
             else:
-                out.append('<td class="%s"%s title="%s">%s</td>' % ("num" if num[i] else "txt", dv, _e(c), _e(c)))
+                out.append('<td class="%s"%s title="%s">%s</td>' % ("num" if num[i] else "txt", dv, _e(c), linkify_cell(c)))
         out.append("</tr>")
     out.append("</tbody></table></div>")
     return "".join(out)
@@ -1370,6 +1443,9 @@ def _svg_graph(it):
                    % (pos[i][0], pos[i][1], pos[j][0], pos[j][1], 1 + 7 * math.sqrt(by / mxe),
                       _e(a), _e(b), _e(human_bytes(by)), "{:,}".format(pk)))
     for nd, (x, y) in zip(nodes, pos):
+        link = nd["ip"] in LINKABLE
+        if link:
+            out.append('<a href="#%s" style="cursor:pointer">' % host_id(nd["ip"]))
         rad = 6 + 20 * math.sqrt(nd["bytes"] / mxn)
         col = color.get(nd["cls"], "var(--c8)")
         out.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" fill-opacity=".85" stroke="var(--card)" stroke-width="2">'
@@ -1378,6 +1454,8 @@ def _svg_graph(it):
                       _e(human_bytes(nd["bytes"])), "{:,}".format(nd["pkts"])))
         lab = nd["label"] if len(nd["label"]) <= 28 else nd["label"][:27] + "…"
         out.append('<text class="lbl" x="%.1f" y="%.1f" text-anchor="middle">%s</text>' % (x, y + rad + 12, _e(lab)))
+        if link:
+            out.append("</a>")
     out.append("</svg>")
     out.append('<div class="graphlegend"><span><b style="background:var(--c1)"></b>private</span>'
                '<span><b style="background:var(--c2)"></b>public</span><span><b style="background:var(--c8)"></b>other</span>'
@@ -1385,7 +1463,36 @@ def _svg_graph(it):
     return "".join(out)
 
 
+def _host_card(h):
+    def mini(title, pairs, linkify_first=False):
+        if not pairs:
+            return ""
+        rows = "".join("<tr><td class=\"txt\">%s</td><td class=\"num\">%s</td></tr>" % (
+            linkify_cell(k) if linkify_first else _e(k), _e(v)) for k, v in pairs)
+        return '<div class="mini"><h3>%s</h3><table>%s</table></div>' % (_e(title), rows)
+    kv = [("Class", h["cls"]), ("Network", h["org"] or "-"), ("Sent", "%s pkts, %s" % ("{:,}".format(h["tx_pkts"]), human_bytes(h["tx_bytes"]))),
+          ("Received", "%s pkts, %s" % ("{:,}".format(h["rx_pkts"]), human_bytes(h["rx_bytes"])))]
+    if h["name"]:
+        kv.insert(1, ("Name (from DNS)", h["name"]))
+    dl = "".join("<dt>%s</dt><dd>%s</dd>" % (_e(k), _e(v)) for k, v in kv)
+    finds = "".join('<div class="finding"><span class="badge %s">%s</span><span>%s</span></div>' % (
+        sev, SEVERITY[sev][0], linkify(text)) for sev, text in h["findings"])
+    body = "".join([
+        mini("Top peers (by bytes)", [("%s" % p, "%s, %s pkts" % (human_bytes(b), "{:,}".format(pk))) for p, b, pk in h["peers"]], True),
+        mini("Protocols", [(k, "{:,}".format(v)) for k, v in h["protocols"]]),
+        mini("Services contacted on this host", [(k + ("  " + SERVICES.get(int(k.split("/")[0]), "")), "{:,}".format(v)) for k, v in h["services"]]),
+        mini("TLS server names requested", [(k, "{:,}".format(v)) for k, v in h["sni"]]),
+        mini("HTTP hosts requested", [(k, "{:,}".format(v)) for k, v in h["http"]]),
+        mini("DNS names queried by this host", [(k, "{:,}".format(v)) for k, v in h["dns"]]),
+    ])
+    return ('<div class="host" id="%s"><div class="hhead"><h3>%s</h3><a class="back" href="#hosts">&uarr; all hosts</a></div>'
+            '<dl class="kv">%s</dl>%s<div class="minis">%s</div></div>' % (host_id(h["ip"]), _e(h["ip"]), dl,
+                                                                         ('<div class="findings">%s</div>' % finds) if finds else "", body))
+
+
 def render_html(rep):
+    global LINKABLE
+    LINKABLE = set(rep.meta.get("linkable", ()))
     meta = rep.meta
     parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">'
              '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -1408,13 +1515,14 @@ def render_html(rep):
                 body = ('<div class="finding"><span class="ok">&#10004;</span><span>Nothing notable found by the built-in checks.</span></div>'
                         if not it["items"] else "".join(
                             '<div class="finding"><span class="badge %s">%s</span><span>%s</span></div>'
-                            % (sev, SEVERITY[sev][0], _e(text)) for sev, text in it["items"]))
+                            % (sev, SEVERITY[sev][0], linkify(text)) for sev, text in it["items"]))
                 parts.append('<section id="findings"><h2>Findings <span class="note" style="font-weight:400;color:var(--mute)">'
                              '(heuristics - verify before acting)</span></h2><div class="findings">%s</div></section>' % body)
     for s in rep.sections:
         if all(it["t"] in ("kpis", "findings") for it in s["items"]):
             continue
         parts.append('<section id="%s"><h2>%s</h2>' % (_slug(s["title"]), _e(s["title"])))
+
         i, items = 0, s["items"]
         while i < len(items):
             it = items[i]
@@ -1440,7 +1548,10 @@ def render_html(rep):
                     i += 1
                 parts.append('<div class="donuts">%s</div>' % "".join(ds))
                 continue
-            if t == "note":
+            if t == "hosts":
+                parts.append('<p class="note">Click an IP anywhere in this report to jump to its card.</p>'
+                             '<div class="hostlist">%s</div>' % "".join(_host_card(h) for h in it["hosts"]))
+            elif t == "note":
                 if not it.get("text_only"):
                     parts.append('<p class="note">%s</p>' % _e(it["text"]))
             elif t == "timeline":
@@ -1699,6 +1810,24 @@ def build_report(a, path, topn, whois=None):
     R.table(s, "Service banners", ["Banner", "Count", "%"], top(a.banners, 8))
     if a.ntp:
         R.kv(s, "NTP packets", "{:,}".format(a.ntp))
+
+    # ---- host cards (link targets for every IP in the HTML report)
+    s = R.section("HOSTS")
+    hosts = []
+    for ip, _ in ranked[:min(60, max(25, topn * 3))]:
+        pl = sorted(peers[ip], key=lambda x: -x[1])[:6]
+        mention = re.compile(r"(?<![\w.:])" + re.escape(ip) + r"(?![\w.:])")
+        hosts.append({
+            "ip": ip, "name": a.dns_names.get(ip, ""), "cls": ip_class(ip), "org": org(ip) if W else "",
+            "tx_pkts": a.ip_tx_p[ip], "tx_bytes": a.ip_tx_b[ip], "rx_pkts": a.ip_rx_p[ip], "rx_bytes": a.ip_rx_b[ip],
+            "peers": [(named(q), by, a.conv_p[(ip, q) if (ip, q) in a.conv_p else (q, ip)]) for q, by in pl],
+            "protocols": a.ip_stacks[ip].most_common(6),
+            "services": a.ip_services[ip].most_common(6),
+            "sni": a.ip_sni[ip].most_common(5), "http": a.ip_http[ip].most_common(5), "dns": a.ip_dnsq[ip].most_common(5),
+            "findings": [o for o in obs if mention.search(o[1])],
+        })
+    R.hosts(s, hosts)
+    R.meta["linkable"] = {h["ip"] for h in hosts}
     return R
 
 

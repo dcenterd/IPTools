@@ -18,7 +18,7 @@ Most scripts query public data sources ([RIPEstat](https://stat.ripe.net), the R
 | `ripe_ip_checker.py` | Pre-purchase due-diligence report for IPv4 ranges in the RIPE region: ownership, transfers, routing history, RPKI/IRR, reputation, geolocation, past usage, compliance and fragmentation. |
 | `ssl_checker.py` | Checks the SSL/TLS certificate of one or many websites: expiry, invalid/self-signed/wrong-host certificates, missing intermediate (incomplete chain) and DNS failures. Shows a table with issuer and days left, can alert by webhook or e-mail, run on a schedule in the background, and dump certificates as PEM plus decoded text. |
 | `cve_checker.py` | Latest published CVEs from NVD and CIRCL, ranked by real-world risk: CISA KEV (exploited now) first, then EPSS exploitation probability, then CVSS score. Filter by days, keyword, severity or score; table or JSON output. |
-| `ipx.py` | Network diagnostic toolkit (Linux, no root needed): traceroute over ICMP, UDP or TCP, with per-hop ASN/org/country (`--asn`), path MTU discovery (`--mtu`), protocol/host comparison (`--compare`), live per-hop stats with sparklines (`--live`), ping with stats (`--ping`) and TCP/UDP port scan (`--scan`, `--open`). Uses only the standard library. |
+| `ipx.py` | All-in-one network diagnostics (Linux, no root needed): traceroute over ICMP, UDP or TCP, with per-hop ASN/org/country (`--asn`), path MTU discovery (`--mtu`), protocol/host comparison (`--compare`), live per-hop stats with sparklines (`--live`), ping with stats (`--ping`) and TCP/UDP port scan (`--scan`, `--open`). Uses only the standard library. |
 
 ## Requirements
 

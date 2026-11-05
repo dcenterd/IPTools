@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""IP Tools.
+"""ipx - network diagnostic toolkit: traceroute, ping, path MTU and port scan.
 
 Probe types (none need root; Linux):
   icmp  system `ping` with a limited TTL
@@ -719,7 +719,7 @@ def resolve(host):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="IP Tools")
+    ap = argparse.ArgumentParser(description="Network diagnostics: traceroute (ICMP/UDP/TCP) with per-hop ASN, ping, path MTU, protocol comparison, live hop stats and TCP/UDP port scan. Linux, no root.")
     ap.add_argument("hosts", nargs="+", metavar="host")
     ap.add_argument("-m", "--max-hops", type=int, default=30)
     ap.add_argument("-q", "--probes", type=int, default=3)

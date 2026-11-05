@@ -839,6 +839,40 @@ class Analyzer:
             off += 2 + ln
 
 
+# ------------------------------------------------------------------ whois
+
+def public_ips(ips):
+    out = []
+    for ip in ips:
+        try:
+            if ipaddress.ip_address(ip).is_global:
+                out.append(ip)
+        except ValueError:
+            pass
+    return out
+
+
+def cymru_whois(ips, chunk=400):
+    """Bulk whois via Team Cymru -> {ip: {"asn", "cc", "org"}}. Raises OSError if unreachable."""
+    res = {}
+    for i in range(0, len(ips), chunk):
+        q = "begin\nverbose\n" + "\n".join(ips[i:i + chunk]) + "\nend\n"
+        data = b""
+        with socket.create_connection(("whois.cymru.com", 43), timeout=8) as s:
+            s.settimeout(20)
+            s.sendall(q.encode())
+            while True:
+                part = s.recv(8192)
+                if not part:
+                    break
+                data += part
+        for line in data.decode(errors="replace").splitlines():
+            p = [x.strip() for x in line.split("|")]
+            if len(p) >= 7 and p[0].isdigit():       # AS | IP | prefix | CC | registry | allocated | AS name
+                res[p[1]] = {"asn": "AS" + p[0], "cc": p[3], "org": re.sub(r",\s*[A-Z]{2}$", "", p[6])}
+    return res
+
+
 # ------------------------------------------------------------------ report model
 
 SEVERITY = {"high": ("HIGH", "bgred", 0), "medium": ("MEDIUM", "bgyellow", 1), "info": ("INFO", "bgblue", 2)}
@@ -1339,8 +1373,9 @@ def _svg_graph(it):
         rad = 6 + 20 * math.sqrt(nd["bytes"] / mxn)
         col = color.get(nd["cls"], "var(--c8)")
         out.append('<circle cx="%.1f" cy="%.1f" r="%.1f" fill="%s" fill-opacity=".85" stroke="var(--card)" stroke-width="2">'
-                   '<title>%s (%s) - %s, %s packets</title></circle>'
-                   % (x, y, rad, col, _e(nd["label"]), _e(nd["cls"]), _e(human_bytes(nd["bytes"])), "{:,}".format(nd["pkts"])))
+                   '<title>%s (%s)%s - %s, %s packets</title></circle>'
+                   % (x, y, rad, col, _e(nd["label"]), _e(nd["cls"]), _e(" - " + nd["org"] if nd.get("org") else ""),
+                      _e(human_bytes(nd["bytes"])), "{:,}".format(nd["pkts"])))
         lab = nd["label"] if len(nd["label"]) <= 28 else nd["label"][:27] + "…"
         out.append('<text class="lbl" x="%.1f" y="%.1f" text-anchor="middle">%s</text>' % (x, y + rad + 12, _e(lab)))
     out.append("</svg>")
@@ -1430,7 +1465,8 @@ def top(counter, n, total=None, label=None):
     return rows
 
 
-def build_report(a, path, topn):
+def build_report(a, path, topn, whois=None):
+    W = whois or {}
     R = Report()
     m = a.meta
     R.meta = {"path": path, "format": m.get("format", "?")}
@@ -1467,6 +1503,9 @@ def build_report(a, path, topn):
             R.kv(s, "Average rate", "%s, %.1f packets/s" % (human_bps(a.bytes * 8 / dur), a.pkts / dur))
     R.kv(s, "Unique IP addresses", "{:,}".format(len(ips)))
     R.kv(s, "Flows (TCP+UDP)", "{:,}".format(len(a.flows)))
+    if W:
+        R.kv(s, "Whois", "%d of %d public IPs resolved (Team Cymru; country = registration country)" % (
+            len(W), len(public_ips(ips))))
     if m.get("warning"):
         R.kv(s, "Warning", m["warning"])
     if a.malformed:
@@ -1533,18 +1572,39 @@ def build_report(a, path, topn):
         n = a.dns_names.get(ip)
         return "%s  (%s)" % (ip, n) if n else ip
 
+    def org(ip):
+        w = W.get(ip)
+        return "%s  %s (%s)" % (w["asn"], w["org"], w["cc"]) if w else ("private/local" if ip_class(ip) != "public" else "-")
+
+    def with_org(headers, rows):
+        """Insert the whois column after 'Class' when whois data is present."""
+        if not W:
+            return headers, rows
+        return headers[:2] + ["AS / Organisation (country)"] + headers[2:], [r[:2] + (org(r[0].split()[0]),) + r[2:] for r in rows]
+
     def ip_rows(pk, by, n):
         return [(named(ip), ip_class(ip), "{:,}".format(pk[ip]), human_bytes(v), pct(v, a.bytes))
                 for ip, v in by.most_common(n)]
-    R.table(s, "Top senders (by bytes)", ["IP", "Class", "Packets", "Bytes", "% of traffic"],
-            ip_rows(a.ip_tx_p, a.ip_tx_b, topn))
-    R.table(s, "Top receivers (by bytes)", ["IP", "Class", "Packets", "Bytes", "% of traffic"],
-            ip_rows(a.ip_rx_p, a.ip_rx_b, topn))
+    R.table(s, "Top senders (by bytes)", *with_org(["IP", "Class", "Packets", "Bytes", "% of traffic"],
+                                                    ip_rows(a.ip_tx_p, a.ip_tx_b, topn)))
+    R.table(s, "Top receivers (by bytes)", *with_org(["IP", "Class", "Packets", "Bytes", "% of traffic"],
+                                                      ip_rows(a.ip_rx_p, a.ip_rx_b, topn)))
     tot_ip = {ip: a.ip_tx_p[ip] + a.ip_rx_p[ip] for ip in ips}
     tb = {ip: a.ip_tx_b[ip] + a.ip_rx_b[ip] for ip in ips}
     ranked = sorted(tb.items(), key=lambda kv: -kv[1])
-    R.table(s, "Most active IPs (sent + received)", ["IP", "Class", "Packets", "Bytes"],
-            [(named(ip), ip_class(ip), "{:,}".format(tot_ip[ip]), human_bytes(v)) for ip, v in ranked[:topn]])
+    R.table(s, "Most active IPs (sent + received)", *with_org(["IP", "Class", "Packets", "Bytes"],
+            [(named(ip), ip_class(ip), "{:,}".format(tot_ip[ip]), human_bytes(v)) for ip, v in ranked[:topn]]))
+    if W:
+        nets = defaultdict(lambda: [0, 0, set()])
+        for ip, v in tb.items():
+            key = "%s  %s (%s)" % (W[ip]["asn"], W[ip]["org"], W[ip]["cc"]) if ip in W else (
+                "private/local" if ip_class(ip) != "public" else "unresolved public")
+            nets[key][0] += v
+            nets[key][1] += tot_ip[ip]
+            nets[key][2].add(ip)
+        R.table(s, "Top networks / organisations (whois, by bytes)", ["Network", "IPs", "Packets", "Bytes", "% of traffic"],
+                [(k, len(v[2]), "{:,}".format(v[1]), human_bytes(v[0]), pct(v[0], sum(tb.values())))
+                 for k, v in sorted(nets.items(), key=lambda kv: -kv[1][0])[:topn]])
     R.table(s, "Top conversations (IP pairs, by bytes)", ["Host A", "Host B", "Packets", "Bytes"],
             [(x, y, "{:,}".format(a.conv_p[(x, y)]), human_bytes(v)) for (x, y), v in a.conv_b.most_common(topn)])
 
@@ -1552,7 +1612,7 @@ def build_report(a, path, topn):
     keep = [ip for ip, _ in ranked[:24]]
     keepset = set(keep)
     nodes = [{"ip": ip, "label": named(ip) if len(named(ip)) <= 34 else ip, "cls": ip_class(ip),
-              "bytes": tb[ip], "pkts": tot_ip[ip]} for ip in keep]
+              "bytes": tb[ip], "pkts": tot_ip[ip], "org": org(ip) if W else ""} for ip in keep]
     edges = [(x, y, by, a.conv_p[(x, y)]) for (x, y), by in a.conv_b.most_common(400)
              if x in keepset and y in keepset][:60]
     peers = defaultdict(list)
@@ -1562,8 +1622,9 @@ def build_report(a, path, topn):
     hubs = []
     for ip, _ in ranked[:4]:
         pl = sorted(peers[ip], key=lambda p: -p[1])[:5]
-        hubs.append({"ip": ip, "label": named(ip), "cls": ip_class(ip), "bytes": tb[ip],
-                     "peers": [(named(p), by, a.conv_p[(ip, p) if (ip, p) in a.conv_p else (p, ip)]) for p, by in pl]})
+        tag = lambda x: named(x) + ("  [%s %s]" % (W[x]["asn"], W[x]["org"]) if x in W else "")
+        hubs.append({"ip": ip, "label": tag(ip), "cls": ip_class(ip), "bytes": tb[ip],
+                     "peers": [(tag(p), by, a.conv_p[(ip, p) if (ip, p) in a.conv_p else (p, ip)]) for p, by in pl]})
     R.graph(s, nodes, edges, hubs)
 
     cls = Counter(ip_class(ip) for ip in ips)
@@ -1711,6 +1772,8 @@ def main():
     ap.add_argument("--html", metavar="FILE", help="also write a self-contained HTML report with charts")
     ap.add_argument("-q", "--quiet", action="store_true", help="with --html/-o: do not print the report to the terminal")
     ap.add_argument("-o", "--output", help="write the plain-text report to this file as well")
+    ap.add_argument("--whois", action="store_true",
+                    help="look up ASN/organisation/country of the public IPs (sends them to whois.cymru.com)")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto",
                     help="colors in terminal output (default auto; NO_COLOR is respected)")
     args = ap.parse_args()
@@ -1731,7 +1794,15 @@ def main():
     if a.pkts == 0:
         sys.exit("error: no packets found in %s" % args.pcap)
 
-    rep = build_report(a, args.pcap, max(1, args.top))
+    who = None
+    if args.whois:
+        ranked = sorted(public_ips(set(a.ip_tx_b) | set(a.ip_rx_b)),
+                        key=lambda ip: -(a.ip_tx_b[ip] + a.ip_rx_b[ip]))[:1000]
+        try:
+            who = cymru_whois(ranked)
+        except OSError as e:
+            print("warning: whois lookup failed (%s); continuing without it" % e, file=sys.stderr)
+    rep = build_report(a, args.pcap, max(1, args.top), who)
     if args.html:
         with open(args.html, "w", encoding="utf-8") as f:
             f.write(rep.to_html())

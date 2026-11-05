@@ -1,5 +1,5 @@
-// ipx - network diagnostic toolkit: traceroute (ICMP/UDP/TCP), ping, path MTU,
-// protocol comparison, live hop stats and TCP/UDP port scan. Linux, no root needed.
+// ipx - network diagnostic toolkit: traceroute (ICMP/UDP), ping, path MTU,
+// protocol comparison, live hop stats and TCP/UDP port check/scan. Linux, no root needed.
 package main
 
 import (
@@ -22,21 +22,23 @@ type Args struct {
 	Hosts                          []string
 	MaxHops, Probes, Timeout, Port int
 	Proto, Protos, Scan, ScanProto string
+	Output                         string
+	PortSet, Tcp                   bool
 	ASN, MTU, Compare, Live, Ping  bool
 	Open, ShowClosed, NoDNS        bool
 	Interval                       float64
 	Count, PingCount               int
 }
 
-const helpText = `usage: ipx [-h] [-m MAX_HOPS] [-q PROBES] [-w TIMEOUT] [-P {icmp,udp,tcp}]
-           [-u] [-T] [--port PORT] [-a] [--mtu] [--compare]
+const helpText = `usage: ipx [-h] [-m MAX_HOPS] [-q PROBES] [-w TIMEOUT] [-P {icmp,udp}]
+           [-U] [-T] [--port PORT] [-a] [--mtu] [--compare]
            [--protos PROTOS] [--live] [--interval INTERVAL] [--count COUNT]
            [--ping] [-c PING_COUNT] [--scan [PORTS]] [--scan-proto PROTO]
-           [--open] [--show-closed] [-n] [--version]
+           [--open] [--show-closed] [-o FILE] [-n] [--version]
            host [host ...]
 
-Network diagnostics: traceroute (ICMP/UDP/TCP) with per-hop ASN, ping, path
-MTU, protocol comparison, live hop stats and TCP/UDP port scan. Linux, no root.
+Network diagnostics: traceroute (ICMP/UDP) with per-hop ASN, ping, path MTU,
+protocol comparison, live hop stats and TCP/UDP port check/scan. Linux, no root.
 
 positional arguments:
   host
@@ -46,24 +48,23 @@ options:
   -m, --max-hops MAX_HOPS   (default 30)
   -q, --probes PROBES       probes per hop (default 3)
   -w, --timeout TIMEOUT     per-probe timeout in seconds (default 1)
-  -P, --proto {icmp,udp,tcp}
-                        probe type (default: icmp)
-  -u, --udp             shortcut for --proto udp
-  -T, --tcp             shortcut for --proto tcp
-  --port PORT           TCP destination port (default 443)
+  -P, --proto {icmp,udp}
+                        trace probe type (default: icmp)
+  -U, --udp             trace: UDP probes; with --port: check UDP only
+  -T, --tcp             with --port: check TCP only (-T -U = both, the default)
+  --port PORT           nc-style check of this destination port on TCP and/or
+                        UDP, instead of tracing
   -a, --asn             show ASN / org / country per hop
   --mtu                 discover path MTU after tracing
   --compare             compare protocols for one host (several hosts are
                         always compared)
-  --protos PROTOS       compare: protocols to run (default icmp,udp,tcp)
-  --live                after tracing, keep probing every hop and draw live
-                        stats
+  --protos PROTOS       compare: protocols to run (default icmp,udp)
+  --live                keep probing every hop and draw live stats (q to quit)
   --interval INTERVAL   live/ping: seconds between rounds (default 1)
   --count COUNT         live mode: stop after N rounds (0 = forever)
-  --ping                ping the host (ICMP, or TCP connects with -T) instead
-                        of tracing
+  --ping                ICMP ping the host instead of tracing
   -c, --ping-count N    ping: number of probes (default 5)
-  --scan [PORTS]        port check instead of tracing: 'top' (default), or
+  --scan [PORTS]        port scan instead of tracing: 'top' (default), or
                         e.g. 22,80,8000-8100
   --scan-proto PROTO    scan: tcp, udp or tcp,udp (default); on its own it
                         starts a scan of the common ports
@@ -71,6 +72,8 @@ options:
                         confirmed-open ones (uses the common-port list unless
                         --scan PORTS is given)
   --show-closed         scan: also list closed/filtered ports
+  -o, --output FILE     also save the results as plain text (no colors) to
+                        FILE; the live view saves its final summary
   -n, --no-dns          skip reverse DNS
   --version             print version
 `
@@ -98,7 +101,7 @@ type option struct {
 var scanValRE = regexp.MustCompile(`^(top|[0-9][0-9,\-]*)$`)
 
 func parseArgs(argv []string) *Args {
-	a := &Args{MaxHops: 30, Probes: 3, Timeout: 1, Proto: "icmp", Port: 443, Protos: "icmp,udp,tcp",
+	a := &Args{MaxHops: 30, Probes: 3, Timeout: 1, Port: 443, Protos: "icmp,udp",
 		Interval: 1, PingCount: 5}
 	atoi := func(name string, v string) int {
 		n, err := strconv.Atoi(v)
@@ -112,14 +115,15 @@ func parseArgs(argv []string) *Args {
 		{"q", "probes", kValue, func(a *Args, v string) { a.Probes = atoi("-q/--probes", v) }},
 		{"w", "timeout", kValue, func(a *Args, v string) { a.Timeout = atoi("-w/--timeout", v) }},
 		{"P", "proto", kValue, func(a *Args, v string) {
-			if v != "icmp" && v != "udp" && v != "tcp" {
-				usageErr("argument -P/--proto: invalid choice: '%s' (choose from icmp, udp, tcp)", v)
+			if v != "icmp" && v != "udp" {
+				usageErr("argument -P/--proto: invalid choice: '%s' (choose from icmp, udp)", v)
 			}
 			a.Proto = v
 		}},
-		{"u", "udp", kBool, func(a *Args, _ string) { a.Proto = "udp" }},
-		{"T", "tcp", kBool, func(a *Args, _ string) { a.Proto = "tcp" }},
-		{"", "port", kValue, func(a *Args, v string) { a.Port = atoi("--port", v) }},
+		{"U", "udp", kBool, func(a *Args, _ string) { a.Proto = "udp" }},
+		{"T", "tcp", kBool, func(a *Args, _ string) { a.Tcp = true }},
+		{"", "port", kValue, func(a *Args, v string) { a.Port, a.PortSet = atoi("--port", v), true }},
+		{"o", "output", kValue, func(a *Args, v string) { a.Output = v }},
 		{"a", "asn", kBool, func(a *Args, _ string) { a.ASN = true }},
 		{"", "mtu", kBool, func(a *Args, _ string) { a.MTU = true }},
 		{"", "compare", kBool, func(a *Args, _ string) { a.Compare = true }},
@@ -227,6 +231,12 @@ func parseArgs(argv []string) *Args {
 	if a.MaxHops < 1 || a.Probes < 1 || a.Timeout < 1 || a.PingCount < 1 {
 		usageErr("-m, -q, -w and -c must be at least 1")
 	}
+	if a.Tcp && !a.PortSet {
+		usageErr("-T only applies to a port check: use --port N (for a port scan use --scan-proto)")
+	}
+	if a.PortSet && (a.Port < 1 || a.Port > 65535) {
+		usageErr("--port must be 1-65535")
+	}
 	return a
 }
 
@@ -247,7 +257,47 @@ func resolve(host string) string {
 	return ""
 }
 
-func main() { os.Exit(run()) }
+func main() {
+	code := run()
+	closeTee()
+	os.Exit(code)
+}
+
+var pingHints = map[string]string{
+	"debian": "apt install iputils-ping", "ubuntu": "apt install iputils-ping",
+	"fedora": "dnf install iputils", "rhel": "dnf install iputils", "centos": "dnf install iputils",
+	"rocky": "dnf install iputils", "almalinux": "dnf install iputils",
+	"alpine": "apk add iputils", "arch": "pacman -S iputils",
+	"opensuse": "zypper install iputils", "suse": "zypper install iputils",
+}
+
+// checkPrereqs fails early with an install hint when the system ping is needed but missing.
+func checkPrereqs(needsPing bool) {
+	if !needsPing {
+		return
+	}
+	if _, err := exec.LookPath("ping"); err == nil {
+		return
+	}
+	ids := map[string]bool{}
+	if b, err := os.ReadFile("/etc/os-release"); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			if k, v, ok := strings.Cut(line, "="); ok && (k == "ID" || k == "ID_LIKE") {
+				for _, f := range strings.Fields(strings.ToLower(strings.Trim(v, `"`))) {
+					ids[f] = true
+				}
+			}
+		}
+	}
+	hint := "install the iputils package for your distro"
+	for k, h := range pingHints {
+		if ids[k] {
+			hint = "install it with: " + h
+			break
+		}
+	}
+	die("`ping` not found (needed for ICMP traces, --ping, --mtu and --live).\n  %s\n  or use --port / --scan / -U (UDP trace), which don't need it", hint)
+}
 
 func run() int {
 	a := parseArgs(os.Args[1:])
@@ -261,8 +311,26 @@ func run() int {
 		os.Exit(130) // second Ctrl+C: stop immediately
 	}()
 
-	if _, err := exec.LookPath("ping"); err != nil {
-		die("`ping` not found")
+	udpSel := a.Proto == "udp"
+	checkProtos := []string{"udp"}
+	switch {
+	case a.Tcp == udpSel:
+		checkProtos = []string{"tcp", "udp"}
+	case a.Tcp:
+		checkProtos = []string{"tcp"}
+	}
+	if a.Proto == "" {
+		a.Proto = "icmp"
+	}
+	portOnly := a.PortSet || a.Scan != "" || a.Open || a.ScanProto != "" || a.ShowClosed
+	needsPing := a.Ping || a.MTU ||
+		(a.Compare && ((len(a.Hosts) > 1 && a.Proto != "udp") || strings.Contains(a.Protos, "icmp"))) ||
+		(!portOnly && !a.Compare && a.Proto != "udp")
+	checkPrereqs(needsPing)
+	if a.Output != "" {
+		if err := openTee(a.Output); err != nil {
+			die("cannot write %s: %v", a.Output, err)
+		}
 	}
 	comparing := a.Compare || len(a.Hosts) > 1
 	if comparing && (a.Live || a.MTU) {
@@ -282,10 +350,11 @@ func run() int {
 	if (a.Open || a.ScanProto != "" || a.ShowClosed) && a.Scan == "" {
 		a.Scan = "top" // scan options on their own imply a scan
 	}
-	if a.Ping || a.Scan != "" {
+	if a.Ping || a.Scan != "" || a.PortSet {
 		if len(targets) > 1 {
-			die("--ping/--scan take a single host")
+			die("--ping/--scan/--port take a single host")
 		}
+		rc := 0
 		if a.Ping {
 			runPingCmd(a, targets[0][1])
 		}
@@ -295,10 +364,16 @@ func run() int {
 			}
 			runScan(a, targets[0][1])
 		}
+		if a.PortSet && !intr.Load() {
+			if a.Ping || a.Scan != "" {
+				outln("")
+			}
+			rc = runCheck(a, targets[0][1], checkProtos)
+		}
 		if intr.Load() {
 			return 130
 		}
-		return 0
+		return rc
 	}
 	if comparing {
 		runCompare(a, targets)
@@ -309,7 +384,22 @@ func run() int {
 	}
 
 	host, target := targets[0][0], targets[0][1]
-	hops, _ := runSingle(a, host, target)
+	var hops []*Hop
+	if a.Live {
+		// discover the path silently; the live view is the only output
+		out("%sDiscovering path to %s ...%s", DIM, target, RESET)
+		hops, _ = tracePath(target, a.Proto, a, nil)
+		out("\r\033[K")
+		found := false
+		for _, h := range hops {
+			found = found || h.IP != ""
+		}
+		if !found && !intr.Load() {
+			die("no hops discovered towards %s", target)
+		}
+	} else {
+		hops, _ = runSingle(a, host, target)
+	}
 	if intr.Load() {
 		return interrupted()
 	}

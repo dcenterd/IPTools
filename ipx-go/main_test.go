@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"net"
+	"os"
 	"reflect"
 	"testing"
 )
@@ -20,8 +21,8 @@ func TestParsePorts(t *testing.T) {
 }
 
 func TestParseArgs(t *testing.T) {
-	a := parseArgs([]string{"example.org", "-aT", "-m10", "--port=8443", "--scan", "22,80", "--open", "-c", "7"})
-	if a.Hosts[0] != "example.org" || !a.ASN || a.Proto != "tcp" || a.MaxHops != 10 ||
+	a := parseArgs([]string{"example.org", "-aU", "-m10", "--port=8443", "--scan", "22,80", "--open", "-c", "7"})
+	if a.Hosts[0] != "example.org" || !a.ASN || a.Proto != "udp" || a.MaxHops != 10 ||
 		a.Port != 8443 || a.Scan != "22,80" || !a.Open || a.PingCount != 7 {
 		t.Fatalf("unexpected: %+v", a)
 	}
@@ -56,5 +57,34 @@ func TestSparkline(t *testing.T) {
 func TestBarClamps(t *testing.T) {
 	if bar(5, 0, 10, "x") == "" || bar(99, 10, 10, "x") == "" {
 		t.Fatal("bar should render for odd inputs")
+	}
+}
+
+func TestParseArgsPortCheck(t *testing.T) {
+	a := parseArgs([]string{"h", "--port", "53", "-T", "-o", "out.txt"})
+	if !a.PortSet || a.Port != 53 || !a.Tcp || a.Output != "out.txt" || a.Proto != "" {
+		t.Fatalf("unexpected: %+v", a)
+	}
+	if b := parseArgs([]string{"h", "-U"}); b.Proto != "udp" || b.PortSet || b.Tcp {
+		t.Fatalf("unexpected: %+v", b)
+	}
+}
+
+func TestTeeStripsColorsAndBars(t *testing.T) {
+	path := t.TempDir() + "/o.txt"
+	if err := openTee(path); err != nil {
+		t.Fatal(err)
+	}
+	out("%sbold%s line\n", BOLD, RESET)
+	out("bar 10%%")
+	out("\r\033[Kbar 100%%\n")
+	tee.setPaused(true)
+	out("hidden\n")
+	tee.setPaused(false)
+	out("tail")
+	closeTee()
+	b, _ := os.ReadFile(path)
+	if want := "bold line\nbar 100%\ntail\n"; string(b) != want {
+		t.Fatalf("got %q want %q", b, want)
 	}
 }

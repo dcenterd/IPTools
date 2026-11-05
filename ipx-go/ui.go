@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,12 +25,79 @@ func init() {
 	}
 }
 
-func out(format string, a ...any)   { fmt.Fprintf(os.Stdout, format, a...) }
-func outln(format string, a ...any) { fmt.Fprintf(os.Stdout, format+"\n", a...) }
+func out(format string, a ...any) {
+	s := fmt.Sprintf(format, a...)
+	os.Stdout.WriteString(s)
+	if tee != nil {
+		tee.write(s)
+	}
+}
+func outln(format string, a ...any) { out(format+"\n", a...) }
 
 func die(format string, a ...any) {
+	closeTee()
 	fmt.Fprintf(os.Stderr, "error: "+format+"\n", a...)
 	os.Exit(1)
+}
+
+// teeWriter keeps a plain-text copy of the output (no colors, no progress bars) for -o/--output.
+type teeWriter struct {
+	mu     sync.Mutex
+	f      *os.File
+	line   []rune
+	paused bool // live view: only the final summary is saved
+}
+
+var (
+	tee    *teeWriter
+	ansiRE = regexp.MustCompile("\x1b\\[[0-9;?]*[A-Za-z]")
+)
+
+func openTee(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	tee = &teeWriter{f: f}
+	return nil
+}
+
+func (t *teeWriter) write(s string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.paused {
+		return
+	}
+	for _, ch := range ansiRE.ReplaceAllString(s, "") {
+		switch ch {
+		case '\n':
+			t.f.WriteString(string(t.line) + "\n")
+			t.line = t.line[:0]
+		case '\r':
+			t.line = t.line[:0] // a redrawn line (progress bar) replaces the previous one
+		default:
+			t.line = append(t.line, ch)
+		}
+	}
+}
+
+func (t *teeWriter) setPaused(p bool) {
+	t.mu.Lock()
+	t.paused = p
+	t.mu.Unlock()
+}
+
+func closeTee() {
+	if tee == nil {
+		return
+	}
+	tee.mu.Lock()
+	defer tee.mu.Unlock()
+	if strings.TrimSpace(string(tee.line)) != "" {
+		tee.f.WriteString(string(tee.line) + "\n")
+	}
+	tee.f.Close()
+	tee = nil
 }
 
 func rttColor(ms float64) string {

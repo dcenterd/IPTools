@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func fnum(v float64) string {
@@ -40,7 +42,7 @@ func runLive(a *Args, target string, hopIPs []string, send func(ttl, i int) Res)
 		var sb []byte
 		add := func(s string) { sb = append(sb, s+"\033[K\n"...) }
 		add(BOLD + CYAN + "LIVE trace" + RESET + " to " + MAGENTA + target + RESET + " via " + YELLOW + protoLabel(a.Proto, a) + RESET +
-			"  " + DIM + "round " + strconv.Itoa(rnd) + "  elapsed " + padL(strconv.Itoa(int(time.Since(t0).Seconds())), 5) + "s  Ctrl+C to quit" + RESET)
+			"  " + DIM + "round " + strconv.Itoa(rnd) + "  elapsed " + padL(strconv.Itoa(int(time.Since(t0).Seconds())), 5) + "s  q to quit" + RESET)
 		add("")
 		add(DIM + padL("HOP", 3) + "  " + padR("IP", 16) + " " + padL("LOSS", 6) + " " + padL("LAST", 7) + " " + padL("AVG", 7) + " " +
 			padL("BEST", 7) + " " + padL("WRST", 7) + "  " + padR("HISTORY", sparkW) + "  HOST" + RESET)
@@ -70,7 +72,11 @@ func runLive(a *Args, target string, hopIPs []string, send func(ttl, i int) Res)
 		out("\033[H%s\033[J", strings.TrimSuffix(string(sb), "\n"))
 	}
 
+	if tee != nil {
+		tee.setPaused(true) // the live screen is not saved, only the final summary
+	}
 	out("\033[?1049h\033[?25l") // alt screen, hide cursor
+	restoreTTY := enableKeys()
 	rnd := 0
 	type reply struct {
 		i   int
@@ -110,19 +116,23 @@ loop:
 				}
 			}
 			render(rnd)
-			if intr.Load() {
+			if intr.Load() || keyQuit() {
 				break loop
 			}
 		}
 		deadline := time.Now().Add(time.Duration(a.Interval * float64(time.Second)))
 		for time.Now().Before(deadline) && (a.Count == 0 || rnd < a.Count) {
-			if intr.Load() {
+			if intr.Load() || keyQuit() {
 				break loop
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
+	restoreTTY()
 	out("\033[?25h\033[?1049l")
+	if tee != nil {
+		tee.setPaused(false)
+	}
 	// leave a final snapshot on the normal screen
 	outln("%s%sLIVE trace summary%s for %s (%d rounds)", BOLD, CYAN, RESET, target, rnd)
 	for i := 0; i < n; i++ {
@@ -159,4 +169,36 @@ func nans(n int) []float64 {
 		s[i] = math.NaN()
 	}
 	return s
+}
+
+// enableKeys switches stdin to single-key mode (no Enter, no echo; Ctrl+C still works).
+// It returns a function that restores the terminal; it does nothing if stdin is not a tty.
+func enableKeys() func() {
+	old, err := unix.IoctlGetTermios(0, unix.TCGETS)
+	if err != nil {
+		return func() {}
+	}
+	raw := *old
+	raw.Lflag &^= unix.ICANON | unix.ECHO
+	raw.Cc[unix.VMIN], raw.Cc[unix.VTIME] = 1, 0
+	if unix.IoctlSetTermios(0, unix.TCSETS, &raw) != nil {
+		return func() {}
+	}
+	return func() { unix.IoctlSetTermios(0, unix.TCSETS, old) }
+}
+
+// keyQuit reports whether q/Q was pressed (non-blocking).
+func keyQuit() bool {
+	pfd := []unix.PollFd{{Fd: 0, Events: unix.POLLIN}}
+	if n, _ := unix.Poll(pfd, 0); n <= 0 || pfd[0].Revents&unix.POLLIN == 0 {
+		return false
+	}
+	buf := make([]byte, 64)
+	n, _ := unix.Read(0, buf)
+	for _, c := range buf[:max(n, 0)] {
+		if c == 'q' || c == 'Q' {
+			return true
+		}
+	}
+	return false
 }

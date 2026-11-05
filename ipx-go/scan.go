@@ -350,3 +350,37 @@ func runScan(a *Args, target string) {
 		outln("  %sopen|filtered = no reply (UDP services often stay silent, or a firewall drops it)%s", DIM, RESET)
 	}
 }
+
+// runCheck is the nc -zv style check of one port; returns 0 if open on any protocol, else 1.
+func runCheck(a *Args, target string, protos []string) int {
+	outln("%s%sPort check%s %s%s%s:%s%d%s  timeout %ds\n", BOLD, CYAN, RESET, MAGENTA, target, RESET, YELLOW, a.Port, RESET, a.Timeout)
+	outln("%s%9s  %-14s %8s  SERVICE%s", DIM, "PORT", "STATE", "RTT", RESET)
+	ok := false
+	for _, proto := range protos {
+		var state string
+		var rtt float64
+		var has bool
+		if proto == "tcp" {
+			state, rtt, has = scanTCP(target, a.Port, time.Duration(a.Timeout)*time.Second)
+		} else {
+			state, rtt, has = scanUDP(target, a.Port, time.Duration(a.Timeout)*time.Second)
+		}
+		ok = ok || state == "open"
+		rtts := padL("-", 8)
+		if has {
+			rtts = padL(strconv.FormatFloat(rtt, 'f', 1, 64), 6) + "ms"
+		}
+		outln("%s/%s  %s%s%s %s  %s%s%s", padL(strconv.Itoa(a.Port), 5), padR(proto, 3),
+			colorFor(state), padR(state, 14), RESET, rtts, CYAN, serviceName(a.Port, proto), RESET)
+	}
+	for _, p := range protos {
+		if p == "udp" {
+			outln("\n%sUDP has no handshake: open|filtered = no reply (service silent or firewall drop)%s", DIM, RESET)
+			break
+		}
+	}
+	if ok {
+		return 0
+	}
+	return 1
+}

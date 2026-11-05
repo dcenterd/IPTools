@@ -28,30 +28,14 @@ func sleepIntr(d time.Duration) {
 }
 
 func runPingCmd(a *Args, target string) {
-	if a.Proto == "udp" {
-		die("--ping supports icmp and tcp (use -T for a TCP ping)")
-	}
-	tcp := a.Proto == "tcp"
 	kind := "ICMP"
-	if tcp {
-		kind = "TCP:" + strconv.Itoa(a.Port)
-	}
 	w := barWidth()
 	outln("%s%sPing%s %s%s%s via %s%s%s, %d probes\n", BOLD, CYAN, RESET, MAGENTA, target, RESET, YELLOW, kind, RESET, a.PingCount)
 	var rtts []float64
 	out("%s", bar(0, a.PingCount, w, "Pinging"))
 	for seq := 1; seq <= a.PingCount && !intr.Load(); seq++ {
 		t0 := time.Now()
-		var rtt float64
-		if tcp {
-			if r := probeTCP(target, 64, a.Timeout, a.Port); r.Has {
-				rtt = r.RTT
-			} else {
-				rtt = math.NaN()
-			}
-		} else {
-			rtt = pingICMP(target, a.Timeout)
-		}
+		rtt := pingICMP(target, a.Timeout)
 		rtts = append(rtts, rtt)
 		res := RED + "timeout" + RESET
 		if !math.IsNaN(rtt) {

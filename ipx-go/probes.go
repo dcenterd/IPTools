@@ -145,41 +145,12 @@ func probeUDP(target string, ttl, timeout, port int) Res {
 	return Res{IP: ip, RTT: rtt, Has: true, Reached: t == 3 && c == 3}
 }
 
-// probeTCP sends a SYN. Hop IPs come from ICMP time-exceeded; the target answers
-// with SYN/ACK (connected) or RST (refused) - both count as reached.
-func probeTCP(target string, ttl, timeout, port int) Res {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return Res{}
-	}
-	defer unix.Close(fd)
-	if unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_TTL, ttl) != nil ||
-		unix.SetsockoptInt(fd, unix.SOL_IP, unix.IP_RECVERR, 1) != nil {
-		return Res{}
-	}
-	start := time.Now()
-	_ = unix.Connect(fd, &unix.SockaddrInet4{Port: port, Addr: addr4(target)}) // EINPROGRESS expected
-	if _, ok := pollFD(fd, unix.POLLOUT|unix.POLLERR|unix.POLLIN, time.Duration(timeout)*time.Second); !ok {
-		return Res{}
-	}
-	rtt := ms(start)
-	if ip, _, _, ok := readICMPError(fd); ok {
-		return Res{IP: ip, RTT: rtt, Has: true}
-	}
-	if e, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR); err == nil && (e == 0 || e == int(unix.ECONNREFUSED)) {
-		return Res{IP: target, RTT: rtt, Has: true, Reached: true}
-	}
-	return Res{}
-}
-
 func makeSender(proto, target string, a *Args) func(ttl, i int) Res {
 	switch proto {
 	case "udp":
 		return func(ttl, i int) Res {
 			return probeUDP(target, ttl, a.Timeout, udpBasePort+(ttl-1)*a.Probes+i)
 		}
-	case "tcp":
-		return func(ttl, i int) Res { return probeTCP(target, ttl, a.Timeout, a.Port) }
 	}
 	return func(ttl, i int) Res { return probeICMP(target, ttl, a.Timeout) }
 }

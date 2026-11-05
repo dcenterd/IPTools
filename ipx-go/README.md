@@ -1,6 +1,6 @@
 # ipx (Go)
 
-Single static binary version of [`ipx.py`](../ipx.py): traceroute over ICMP/UDP/TCP with per-hop ASN, path MTU discovery, protocol/host comparison, live per-hop stats, ping, and TCP/UDP port scan. Linux only, no root needed, no runtime dependencies except the system `ping` command.
+Single static binary version of [`ipx.py`](../ipx.py): traceroute over ICMP/UDP with per-hop ASN, path MTU discovery, protocol/host comparison, live per-hop stats (`q` to quit), ping, an nc-style TCP/UDP port check (`--port`) and port scan. `-o FILE` saves a plain-text copy of the results. Linux only, no root needed, no runtime dependencies except the system `ping` command.
 
 ## Install
 
@@ -18,11 +18,14 @@ Same flags as the Python version:
 
 ```sh
 ipx 8.8.8.8 --asn                      # trace with ASN/org/country per hop
-ipx example.org -T --port 443 --mtu    # TCP trace, then path MTU
+ipx example.org --mtu                  # ICMP trace, then path MTU
+ipx example.org --port 443             # nc-style check of TCP and UDP 443
+ipx example.org --port 53 -U           # UDP only (-T for TCP only)
 ipx 8.8.8.8 1.1.1.1 --compare          # compare hosts
-ipx 8.8.8.8 --compare --protos icmp,udp,tcp
+ipx 8.8.8.8 --compare --protos icmp,udp
 ipx 8.8.8.8 --live                     # live per-hop stats
 ipx 8.8.8.8 --ping -c 10               # default is 5 probes
+ipx 8.8.8.8 --asn -o trace.txt         # also save a plain-text copy (no colors)
 ipx example.org --scan 22,80,443 --open
 ```
 
@@ -36,4 +39,4 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=dev" -o ipx .
 go test ./...
 ```
 
-Notes: as in the Python version, ICMP probes use the system `ping` (needs the `iputils-ping` package); UDP and TCP probes use plain sockets with `IP_RECVERR`. IPv4 only.
+Notes: as in the Python version, ICMP probes use the system `ping` (needs the `iputils-ping` package); UDP probes use plain sockets with `IP_RECVERR`; the system `ping` is only needed for ICMP traces, `--ping`, `--mtu` and `--live` (not for `--port`, `--scan` or `-U`). IPv4 only.

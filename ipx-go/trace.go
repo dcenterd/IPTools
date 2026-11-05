@@ -73,12 +73,7 @@ func tracePath(target, proto string, a *Args, onHop func(*Hop)) ([]*Hop, int) {
 	return hops, 0
 }
 
-func protoLabel(proto string, a *Args) string {
-	if proto == "tcp" {
-		return "TCP:" + strconv.Itoa(a.Port)
-	}
-	return strings.ToUpper(proto)
-}
+func protoLabel(proto string, a *Args) string { return strings.ToUpper(proto) }
 
 func runSingle(a *Args, host, target string) ([]*Hop, int) {
 	w := barWidth()
@@ -153,7 +148,7 @@ func runCompare(a *Args, targets [][2]string) {
 			if p == "" {
 				continue
 			}
-			if p != "icmp" && p != "udp" && p != "tcp" {
+			if p != "icmp" && p != "udp" {
 				bad = append(bad, p)
 				continue
 			}

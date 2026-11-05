@@ -18,7 +18,7 @@ Most scripts query public data sources ([RIPEstat](https://stat.ripe.net), the R
 | `ripe_ip_checker.py` | Pre-purchase due-diligence report for IPv4 ranges in the RIPE region: ownership, transfers, routing history, RPKI/IRR, reputation, geolocation, past usage, compliance and fragmentation. |
 | `ssl_checker.py` | Checks the SSL/TLS certificate of one or many websites: expiry, invalid/self-signed/wrong-host certificates, missing intermediate (incomplete chain) and DNS failures. Shows a table with issuer and days left, can alert by webhook or e-mail, run on a schedule in the background, and dump certificates as PEM plus decoded text. |
 | `cve_checker.py` | Latest published CVEs from NVD and CIRCL, ranked by real-world risk: CISA KEV (exploited now) first, then EPSS exploitation probability, then CVSS score. Filter by days, keyword, severity or score; table or JSON output. |
-| `ipx.py` | All-in-one network diagnostics (Linux, no root needed): traceroute over ICMP, UDP or TCP, with per-hop ASN/org/country (`--asn`), path MTU discovery (`--mtu`), protocol/host comparison (`--compare`), live per-hop stats with sparklines (`--live`), ping with stats (`--ping`) and TCP/UDP port scan (`--scan`, `--open`). Uses only the standard library. A single-binary Go port lives in [`ipx-go/`](ipx-go/) (prebuilt Linux amd64/arm64 on the [Releases](https://github.com/dcenterd/IPTools/releases) page). |
+| `ipx.py` | All-in-one network diagnostics (Linux, no root needed): traceroute over ICMP or UDP, with per-hop ASN/org/country (`--asn`), path MTU discovery (`--mtu`), protocol/host comparison (`--compare`), live per-hop stats with sparklines (`--live`), ping with stats (`--ping`), an nc-style TCP/UDP port check (`--port N`) and port scan (`--scan`, `--open`). Uses only the standard library. A single-binary Go port lives in [`ipx-go/`](ipx-go/) (prebuilt Linux amd64/arm64 on the [Releases](https://github.com/dcenterd/IPTools/releases) page). |
 | `pcap_analyzer.py` | Packet-capture debugger (`.pcap`, `.pcapng`, `.gz`; standard library only). Text dashboard or `--html` report with charts, a conversation map and clickable per-host cards (clickable traffic-over-time bars with per-window details, KPI cards and donut slices that jump to their sections, networks table with linked IPs, back-to-top button); `--json`. Covers layers 1-7 plus: **expert findings with packet numbers and ready-to-paste Wireshark filters**; per-flow TCP health (handshake/RTT, retransmissions, dup-ACKs, zero-window, resets) with ladder diagrams, throughput and sequence graphs; latency tables (TCP handshake, DNS, TLS, HTTP); path/MTU checks (MSS, ICMP fragmentation-needed, PMTU black holes); L2 discovery (LLDP/CDP neighbours, STP changes, DHCP problems, ARP sweeps/storms, duplicate IPs, broadcast storms); TLS certificates (expiry, self-signed, weak key/signature, name mismatch), JA3 fingerprints and beaconing detection; `--whois` for ASN/org/country. Filters (`--host --port --proto --flow --from --to`) narrow the analysis and `--extract` writes the selection to a new pcap. |
 
 ## Requirements
@@ -78,12 +78,17 @@ pip install -r requirements.txt
 ./cve_checker.py --keyword "PHP before" --days 30
 ./cve_checker.py --kev                     # only actively exploited
 
-# traceroute / ping / MTU / port scan (Linux, no root)
+# traceroute / ping / MTU / port check+scan (Linux, no root)
+# prerequisites: Linux, python3 >= 3.8 (standard library only) and the system `ping` (iputils;
+#   apt install iputils-ping | dnf install iputils | apk add iputils) - ping is not needed for --port/--scan/-U
 ./ipx.py 8.8.8.8 --asn                     # trace with ASN/org/country per hop
-./ipx.py example.org -T --port 443 --mtu   # TCP trace, then path MTU
+./ipx.py example.org --mtu                 # ICMP trace, then path MTU
+./ipx.py example.org --port 443            # nc-style check of TCP and UDP 443
+./ipx.py example.org --port 53 -U          # UDP only (-T for TCP only)
 ./ipx.py 8.8.8.8 1.1.1.1 --compare         # compare hosts/protocols
 ./ipx.py 8.8.8.8 --live                    # live per-hop stats
 ./ipx.py 8.8.8.8 --ping -c 10
+./ipx.py 8.8.8.8 --asn -o trace.txt        # also save a plain-text copy (no colors)
 ./ipx.py example.org --scan 22,80,443 --open
 ```
 

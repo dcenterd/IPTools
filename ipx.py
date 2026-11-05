@@ -4,34 +4,43 @@
 Probe types (none need root; Linux):
   icmp  system `ping` with a limited TTL
   udp   UDP datagrams, ICMP replies read through IP_RECVERR
-  tcp   non-blocking TCP SYNs, ICMP replies read through IP_RECVERR
 
 Extras:
   --asn      ASN / org / country per hop (Team Cymru whois)
   --mtu      path MTU discovery (DF pings, binary search)
-  --compare  compare ICMP/UDP/TCP paths to one host, or several hosts side by side
+  --compare  compare ICMP/UDP paths to one host, or several hosts side by side
   --live     keep probing every hop and show live stats + sparklines
-  --ping     ICMP (or TCP with -T) ping with stats, instead of tracing
-  --scan     TCP/UDP port check, instead of tracing
+  --ping     ICMP ping with stats, instead of tracing
+  --port N   nc-style check of one TCP and/or UDP port (-T / -U pick one), instead of tracing
+  --scan     TCP/UDP port scan (many ports), instead of tracing
   --open     find open ports on both TCP and UDP (confirmed-open only)
 
-Usage: ipx.py <host> [host ...] [-P icmp|udp|tcp | -u | -T] [--port N]
-                     [--asn] [--mtu] [--compare [--protos icmp,udp,tcp]] [--live]
+Usage: ipx.py <host> [host ...] [-P icmp|udp | -U]  |  --port N [-T] [-U]
+                     [--asn] [--mtu] [--compare [--protos icmp,udp]] [--live]
                      [--ping [-c N]] [--scan [PORTS] [--scan-proto tcp,udp] | --open]
 """
+import sys
+
+if sys.version_info < (3, 8):
+    sys.exit(f"error: Python 3.8+ required (found {sys.version.split()[0]}); "
+             "install a newer python3 (e.g. `apt install python3`, `dnf install python3`, `apk add python3`)")
+
 import argparse
+import atexit
 import errno
 import ipaddress
 import math
+import os
 import re
 import select
 import shutil
 import socket
 import struct
 import subprocess
-import sys
 import threading
+import termios
 import time
+import tty
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -108,40 +117,11 @@ def probe_udp(target, ttl, timeout, port):
         sock.close()
 
 
-def probe_tcp(target, ttl, timeout, port):
-    """TCP SYN probe. Hop IPs come from ICMP time-exceeded; the target answers with
-    SYN/ACK (connected) or RST (refused) - both count as reached."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.setblocking(False)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
-        sock.setsockopt(socket.SOL_IP, IP_RECVERR, 1)
-        start = time.monotonic()
-        sock.connect_ex((target, port))
-        poller = select.poll()
-        poller.register(sock, select.POLLOUT | select.POLLERR | select.POLLIN)
-        if not poller.poll(timeout * 1000):
-            return None, None, False
-        rtt = (time.monotonic() - start) * 1000
-        err = read_icmp_error(sock)
-        if err:
-            return err[0], rtt, False
-        if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) in (0, errno.ECONNREFUSED):
-            return target, rtt, True
-        return None, None, False
-    except OSError:
-        return None, None, False
-    finally:
-        sock.close()
-
-
 def make_sender(proto, target, args):
     """Return send(ttl, i) -> (ip, rtt, reached) for the chosen protocol."""
     if proto == "udp":
         return lambda ttl, i: probe_udp(target, ttl, args.timeout,
                                         UDP_BASE_PORT + (ttl - 1) * args.probes + i)
-    if proto == "tcp":
-        return lambda ttl, i: probe_tcp(target, ttl, args.timeout, args.port)
     return lambda ttl, i: probe(target, ttl, args.timeout)
 
 
@@ -243,7 +223,7 @@ def trace_path(target, proto, args, on_hop=None):
 
 
 def proto_label(proto, args):
-    return f"TCP:{args.port}" if proto == "tcp" else proto.upper()
+    return proto.upper()
 
 
 def run_single(args, host, target):
@@ -284,7 +264,7 @@ def run_compare(args, targets):
     else:
         t = targets[0][1]
         protos = [p.strip() for p in args.protos.split(",") if p.strip()]
-        bad = [p for p in protos if p not in ("icmp", "udp", "tcp")]
+        bad = [p for p in protos if p not in ("icmp", "udp")]
         if bad:
             sys.exit(f"error: unknown protocol(s) in --protos: {', '.join(bad)}")
         jobs = [(proto_label(p, args), t, p) for p in protos]
@@ -448,7 +428,7 @@ def run_live(args, target, hop_ips, send):
     def render(rnd):
         out = [f"{BOLD}{CYAN}LIVE trace{RESET} to {MAGENTA}{target}{RESET} via "
                f"{YELLOW}{proto_label(args.proto, args)}{RESET}  {DIM}round {rnd}  "
-               f"elapsed {time.monotonic() - t0:5.0f}s  Ctrl+C to quit{RESET}", "",
+               f"elapsed {time.monotonic() - t0:5.0f}s  q to quit{RESET}", "",
                f"{DIM}{'HOP':>3}  {'IP':<16} {'LOSS':>6} {'LAST':>7} {'AVG':>7} "
                f"{'BEST':>7} {'WRST':>7}  {'HISTORY':<{spark_w}}  HOST{RESET}"]
         num = lambda v: f"{rtt_color(v)}{v:7.1f}{RESET}" if v is not None else f"{DIM}{'-':>7}{RESET}"
@@ -464,8 +444,24 @@ def run_live(args, target, hop_ips, send):
         sys.stdout.write("\033[H" + "".join(l + "\033[K\n" for l in out[:-1]) + out[-1] + "\033[K\033[J")
         sys.stdout.flush()
 
+    sys.stdout.paused = True  # the live screen is not saved, only the final summary
     sys.stdout.write("\033[?1049h\033[?25l")  # alt screen, hide cursor
     rnd = 0
+    # cbreak: read single keys without Enter (Ctrl+C still works); skipped if stdin isn't a tty
+    fd, old_tty = None, None
+    if sys.stdin.isatty():
+        try:
+            fd = sys.stdin.fileno()
+            old_tty = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except termios.error:
+            fd = old_tty = None
+
+    def check_quit():
+        if fd is not None and select.select([fd], [], [], 0)[0]:
+            if os.read(fd, 64).lower().find(b"q") >= 0:
+                raise KeyboardInterrupt
+
     try:
         while not args.count or rnd < args.count:
             rnd += 1
@@ -482,14 +478,19 @@ def run_live(args, target, hop_ips, send):
                     best[i] = rtt if best[i] is None else min(best[i], rtt)
                     worst[i] = rtt if worst[i] is None else max(worst[i], rtt)
                 render(rnd)
+                check_quit()
             deadline = time.monotonic() + args.interval
             while time.monotonic() < deadline and (not args.count or rnd < args.count):
                 time.sleep(0.05)
+                check_quit()
     except KeyboardInterrupt:
         pass
     finally:
+        if old_tty is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_tty)
         pool.shutdown(wait=False, cancel_futures=True)
         sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.paused = False
         sys.stdout.flush()
     # leave a final snapshot on the normal screen
     fmt = lambda v: f"{v:.1f}" if v is not None else "-"
@@ -518,11 +519,8 @@ def ping_icmp(target, timeout):
 
 
 def run_ping(args, target):
-    """Ping the target with ICMP (default) or TCP connects; live lines + bottom bar."""
-    if args.proto == "udp":
-        sys.exit("error: --ping supports icmp and tcp (use -T for a TCP ping)")
-    tcp = args.proto == "tcp"
-    kind = f"TCP:{args.port}" if tcp else "ICMP"
+    """ICMP ping; live lines + bottom bar."""
+    kind = "ICMP"
     w = bar_width()
     print(f"{BOLD}{CYAN}Ping{RESET} {MAGENTA}{target}{RESET} via {YELLOW}{kind}{RESET}, "
           f"{args.ping_count} probes\n")
@@ -531,7 +529,7 @@ def run_ping(args, target):
     try:
         for seq in range(1, args.ping_count + 1):
             t0 = time.monotonic()
-            rtt = probe_tcp(target, 64, args.timeout, args.port)[1] if tcp else ping_icmp(target, args.timeout)
+            rtt = ping_icmp(target, args.timeout)
             sent += 1
             rtts.append(rtt)
             res = (f"{GREEN}reply{RESET} from {MAGENTA}{target}{RESET}  time {rtt_color(rtt)}{rtt:7.1f} ms{RESET}"
@@ -709,7 +707,51 @@ def run_scan(args, target):
         print(f"  {DIM}open|filtered = no reply (UDP services often stay silent, or a firewall drops it){RESET}")
 
 
+def run_check(args, target, protos):
+    """nc -zv style check of one port. Exit status 0 if any protocol is open."""
+    print(f"{BOLD}{CYAN}Port check{RESET} {MAGENTA}{target}{RESET}:{YELLOW}{args.port}{RESET}  "
+          f"timeout {args.timeout}s\n")
+    print(f"{DIM}{'PORT':>9}  {'STATE':<14} {'RTT':>8}  SERVICE{RESET}")
+    ok = False
+    for proto in protos:
+        state, rtt = (scan_tcp if proto == "tcp" else scan_udp)(target, args.port, args.timeout)
+        ok = ok or state == "open"
+        rtt_txt = f"{rtt:6.1f}ms" if rtt is not None else f"{'-':>8}"
+        print(f"{args.port:>5}/{proto:<3}  {STATE_COLOR[state]}{state:<14}{RESET} {rtt_txt}  "
+              f"{CYAN}{service_name(args.port, proto)}{RESET}")
+    if "udp" in protos:
+        print(f"\n{DIM}UDP has no handshake: open|filtered = no reply (service silent or firewall drop){RESET}")
+    return 0 if ok else 1
+
+
 # --------------------------------------------------------------------------- main
+
+PING_HINTS = {
+    "debian": "apt install iputils-ping", "ubuntu": "apt install iputils-ping",
+    "fedora": "dnf install iputils", "rhel": "dnf install iputils", "centos": "dnf install iputils",
+    "rocky": "dnf install iputils", "almalinux": "dnf install iputils",
+    "alpine": "apk add iputils", "arch": "pacman -S iputils",
+    "opensuse": "zypper install iputils", "suse": "zypper install iputils",
+}
+
+
+def check_prereqs(needs_ping):
+    """Fail early with an install hint when something this run needs is missing."""
+    if not sys.platform.startswith("linux"):
+        sys.exit(f"error: ipx needs Linux (found {sys.platform}); it relies on IP_RECVERR sockets")
+    if needs_ping and not shutil.which("ping"):
+        ids = ""
+        try:
+            with open("/etc/os-release") as f:
+                ids = " ".join(l.split("=", 1)[1].strip().strip('"').lower()
+                               for l in f if l.startswith(("ID=", "ID_LIKE=")))
+        except OSError:
+            pass
+        hint = next((h for k, h in PING_HINTS.items() if k in ids.split()), None)
+        sys.exit("error: `ping` not found (needed for ICMP traces, --ping, --mtu and --live).\n"
+                 + (f"  install it with: {hint}\n" if hint else "  install the iputils package for your distro\n")
+                 + "  or use --port / --scan / -U (UDP trace), which don't need it")
+
 
 def resolve(host):
     try:
@@ -718,24 +760,64 @@ def resolve(host):
         sys.exit(f"error: cannot resolve {host}: {e}")
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class Tee:
+    """stdout wrapper that also writes a plain-text copy (no colors, no progress bars) to a file."""
+
+    def __init__(self, out, path):
+        self.out, self.f, self.line, self.paused = out, open(path, "w", encoding="utf-8"), "", False
+
+    def write(self, text):
+        self.out.write(text)
+        if self.paused:
+            return len(text)
+        for ch in ANSI_RE.sub("", text):
+            if ch == "\n":
+                self.f.write(self.line + "\n")
+                self.line = ""
+            elif ch == "\r":
+                self.line = ""      # a redrawn line (progress bar) replaces the previous one
+            else:
+                self.line += ch
+        return len(text)
+
+    def flush(self):
+        self.out.flush()
+        if not self.f.closed:
+            self.f.flush()
+
+    def close(self):
+        if self.f.closed:
+            return
+        if self.line.strip():
+            self.f.write(self.line + "\n")
+        self.f.close()
+
+    def __getattr__(self, name):
+        return getattr(self.out, name)
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Network diagnostics: traceroute (ICMP/UDP/TCP) with per-hop ASN, ping, path MTU, protocol comparison, live hop stats and TCP/UDP port scan. Linux, no root.")
+    ap = argparse.ArgumentParser(description="Network diagnostics: traceroute (ICMP/UDP) with per-hop ASN, ping, path MTU, protocol comparison, live hop stats TCP/UDP port check/scan. Linux, no root.")
     ap.add_argument("hosts", nargs="+", metavar="host")
     ap.add_argument("-m", "--max-hops", type=int, default=30)
     ap.add_argument("-q", "--probes", type=int, default=3)
     ap.add_argument("-w", "--timeout", type=int, default=1, help="per-probe timeout (s)")
-    ap.add_argument("-P", "--proto", choices=["icmp", "udp", "tcp"], default="icmp",
-                    help="probe type (default: icmp)")
-    ap.add_argument("-u", "--udp", action="store_const", const="udp", dest="proto",
-                    help="shortcut for --proto udp")
-    ap.add_argument("-T", "--tcp", action="store_const", const="tcp", dest="proto",
-                    help="shortcut for --proto tcp")
-    ap.add_argument("--port", type=int, default=443, help="TCP destination port (default 443)")
+    ap.add_argument("-P", "--proto", choices=["icmp", "udp"], default=None,
+                    help="trace probe type (default: icmp)")
+    ap.add_argument("-U", "--udp", action="store_const", const="udp", dest="proto",
+                    help="trace: UDP probes; with --port: check UDP only")
+    ap.add_argument("-T", "--tcp", action="store_true",
+                    help="with --port: check TCP only (-T -U = both, the default)")
+    ap.add_argument("--port", type=int, default=None, metavar="PORT",
+                    help="nc-style check of this destination port on TCP and/or UDP, instead of tracing")
     ap.add_argument("-a", "--asn", action="store_true", help="show ASN / org / country per hop")
     ap.add_argument("--mtu", action="store_true", help="discover path MTU after tracing")
     ap.add_argument("--compare", action="store_true",
                     help="compare protocols for one host (several hosts are always compared)")
-    ap.add_argument("--protos", default="icmp,udp,tcp", help="compare: protocols to run")
+    ap.add_argument("--protos", default="icmp,udp", help="compare: protocols to run")
     ap.add_argument("--live", action="store_true",
                     help="after tracing, keep probing every hop and draw live stats")
     ap.add_argument("--interval", type=float, default=1.0, help="live mode: seconds between rounds")
@@ -751,11 +833,30 @@ def main():
                     help="scan for open ports on both TCP and UDP, listing only confirmed-open ones "
                          "(uses the common-port list unless --scan PORTS is given)")
     ap.add_argument("--show-closed", action="store_true", help="scan: also list closed/filtered ports")
+    ap.add_argument("-o", "--output", metavar="FILE",
+                    help="also save the results as plain text (no colors) to FILE; the live view saves its final summary")
     ap.add_argument("-n", "--no-dns", action="store_true", help="skip reverse DNS")
     args = ap.parse_args()
+    if args.tcp and args.port is None:
+        ap.error("-T only applies to a port check: use --port N (for a port scan use --scan-proto)")
+    if args.port is not None and not 1 <= args.port <= 65535:
+        ap.error("--port must be 1-65535")
+    check_protos = (["tcp", "udp"] if args.tcp == (args.proto == "udp")
+                    else ["tcp"] if args.tcp else ["udp"])
+    if args.proto is None:
+        args.proto = "icmp"
 
-    if not shutil.which("ping"):
-        sys.exit("error: `ping` not found")
+    port_only = args.port is not None or args.scan or args.open or args.scan_proto or args.show_closed
+    needs_ping = (args.ping or args.mtu
+                  or (args.compare and (len(args.hosts) > 1 and args.proto != "udp" or "icmp" in args.protos))
+                  or (not port_only and not args.compare and args.proto != "udp"))
+    check_prereqs(needs_ping)
+    if args.output:
+        try:
+            sys.stdout = Tee(sys.stdout, args.output)
+        except OSError as e:
+            sys.exit(f"error: cannot write {args.output}: {e}")
+        atexit.register(sys.stdout.close)
     comparing = args.compare or len(args.hosts) > 1
     if comparing and (args.live or args.mtu):
         sys.exit("error: --live and --mtu cannot be combined with compare mode")
@@ -764,22 +865,36 @@ def main():
     try:
         if (args.open or args.scan_proto or args.show_closed) and not args.scan:
             args.scan = "top"  # scan options on their own imply a scan
-        if args.ping or args.scan:
+        if args.ping or args.scan or args.port is not None:
             if len(targets) > 1:
-                sys.exit("error: --ping/--scan take a single host")
+                sys.exit("error: --ping/--scan/--port take a single host")
+            rc = 0
             if args.ping:
                 run_ping(args, targets[0][1])
             if args.scan:
                 if args.ping:
                     print()
                 run_scan(args, targets[0][1])
-            return 0
+            if args.port is not None:
+                if args.ping or args.scan:
+                    print()
+                rc = run_check(args, targets[0][1], check_protos)
+            return rc
         if comparing:
             run_compare(args, targets)
             return 0
 
         host, target = targets[0]
-        hops, _reached = run_single(args, host, target)
+        if args.live:
+            # discover the path silently; the live view is the only output
+            sys.stdout.write(f"{DIM}Discovering path to {target} ...{RESET}")
+            sys.stdout.flush()
+            hops, reached = trace_path(target, args.proto, args)
+            sys.stdout.write("\r\033[K")
+            if not hops or not any(h["ip"] for h in hops):
+                sys.exit(f"error: no hops discovered towards {target}")
+        else:
+            hops, _reached = run_single(args, host, target)
         hop_ips = [h["ip"] for h in hops]
         if args.mtu:
             discover_mtu(args, target, hop_ips)

@@ -2156,7 +2156,7 @@ HTML_CSS = """
 --c8:#8b949e;--high:#ff6b6b;--med:#f0a53a;--info:#58a6ff;--ok:#56d364}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:min(97vw,1900px);margin:0 auto;padding:0 16px}
+.wrap{max-width:min(94vw,1560px);margin:0 auto;padding:0 16px}
 header.top{background:var(--head);color:#fff;padding:22px 0}
 header.top h1{margin:0 0 4px;font-size:22px;font-weight:650;letter-spacing:.2px}
 header.top .sub{color:#aab6c5;font-size:13px;word-break:break-all}

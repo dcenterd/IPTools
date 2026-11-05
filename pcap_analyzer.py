@@ -2230,7 +2230,10 @@ a.back{font-size:12px;color:var(--mute);text-decoration:none}a.back:hover{color:
 .legend em{font-style:normal;color:var(--mute);margin-left:6px}
 .graphlegend{display:flex;gap:16px;font-size:12px;color:var(--mute);margin:4px 0 0}
 .graphlegend b{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px}
-@media print{nav,.theme{display:none}body{background:#fff}section{break-inside:avoid}}
+a.totop{position:fixed;right:22px;bottom:22px;z-index:20;background:var(--c1);color:#fff;text-decoration:none;font-size:13px;font-weight:600;
+padding:9px 14px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.28);opacity:0;visibility:hidden;transform:translateY(8px);transition:opacity .2s,transform .2s,visibility .2s}
+a.totop.show{opacity:1;visibility:visible;transform:none}a.totop:hover{filter:brightness(1.1)}
+@media print{a.totop{display:none}nav,.theme{display:none}body{background:#fff}section{break-inside:avoid}}
 """
 
 HTML_JS = """
@@ -2239,6 +2242,7 @@ if(b)b.onclick=function(){var d=r.getAttribute('data-theme')==='dark'||(!r.getAt
 document.addEventListener('click',function(e){var b=e.target.closest('.copy');if(!b)return;var t=b.dataset.t;
 try{navigator.clipboard.writeText(t)}catch(x){var r=document.createRange();r.selectNodeContents(b.previousElementSibling);getSelection().removeAllRanges();getSelection().addRange(r)}
 b.textContent='copied';setTimeout(function(){b.textContent='copy'},1200)});
+var tt=document.querySelector('.totop');if(tt){var chk=function(){tt.classList.toggle('show',(window.pageYOffset||document.documentElement.scrollTop)>400)};addEventListener('scroll',chk,{passive:true});chk()}
 document.querySelectorAll('table.sortable th').forEach(function(th,i){th.onclick=function(){
 var t=th.closest('table'),tb=t.tBodies[0],dir=th.classList.contains('asc')?-1:1;
 t.querySelectorAll('th').forEach(function(x){x.classList.remove('asc','desc')});th.classList.add(dir===1?'asc':'desc');
@@ -2578,7 +2582,7 @@ def render_html(rep):
     parts = ['<!doctype html><html lang="en"><head><meta charset="utf-8">'
              '<meta name="viewport" content="width=device-width,initial-scale=1">'
              '<title>PCAP report - %s</title><style>%s</style></head><body>' % (_e(os.path.basename(meta.get("path", ""))), HTML_CSS)]
-    parts.append('<header class="top"><div class="wrap"><button class="theme" type="button">Theme</button>'
+    parts.append('<header class="top" id="top"><div class="wrap"><button class="theme" type="button">Theme</button>'
                  '<h1>Packet capture report</h1><div class="sub">%s &middot; %s &middot; generated %s</div></div></header>'
                  % (_e(meta.get("path", "")), _e(meta.get("format", "")), _e(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))))
     nav = [("findings", "Findings")] + [(_slug(s["title"]), _nav_label(s["title"])) for s in rep.sections
@@ -2643,7 +2647,7 @@ def render_html(rep):
                 parts.append("<h3>Conversation map (top hosts)</h3>" + _svg_graph(it))
             i += 1
         parts.append("</section>")
-    parts.append("</main><script>%s</script></body></html>" % HTML_JS)
+    parts.append('</main><a class="totop" href="#top" aria-label="Back to top">&#8593; Top</a><script>%s</script></body></html>' % HTML_JS)
     return "".join(parts)
 
 

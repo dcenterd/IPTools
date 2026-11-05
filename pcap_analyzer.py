@@ -2172,7 +2172,8 @@ main{padding:20px 0 48px}
 .kpi .v{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums;margin:2px 0}
 .kpi .s{font-size:12px;color:var(--mute)}
 section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:18px}
-section h2{margin:0 0 12px;font-size:16px;letter-spacing:.3px}
+section h2{margin:0 0 12px;font-size:16px;letter-spacing:.3px;display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+a.sectop{font-size:12px;font-weight:400;color:var(--mute);text-decoration:none;white-space:nowrap}a.sectop:hover{color:var(--ink)}
 h3{margin:0 0 8px;font-size:13px;color:var(--mute);font-weight:600}
 dl.kv{display:grid;grid-template-columns:minmax(200px,max-content) 1fr;gap:4px 18px;margin:0 0 12px}
 dl.kv dt{color:var(--mute)}dl.kv dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
@@ -2230,6 +2231,7 @@ a.back{font-size:12px;color:var(--mute);text-decoration:none}a.back:hover{color:
 .legend em{font-style:normal;color:var(--mute);margin-left:6px}
 .graphlegend{display:flex;gap:16px;font-size:12px;color:var(--mute);margin:4px 0 0}
 .graphlegend b{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px}
+@media print{a.sectop{display:none}}
 a.totop{position:fixed;right:22px;bottom:22px;z-index:20;background:var(--c1);color:#fff;text-decoration:none;font-size:13px;font-weight:600;
 padding:9px 14px;border-radius:999px;box-shadow:0 2px 10px rgba(0,0,0,.28);opacity:0;visibility:hidden;transform:translateY(8px);transition:opacity .2s,transform .2s,visibility .2s}
 a.totop.show{opacity:1;visibility:visible;transform:none}a.totop:hover{filter:brightness(1.1)}
@@ -2242,7 +2244,13 @@ if(b)b.onclick=function(){var d=r.getAttribute('data-theme')==='dark'||(!r.getAt
 document.addEventListener('click',function(e){var b=e.target.closest('.copy');if(!b)return;var t=b.dataset.t;
 try{navigator.clipboard.writeText(t)}catch(x){var r=document.createRange();r.selectNodeContents(b.previousElementSibling);getSelection().removeAllRanges();getSelection().addRange(r)}
 b.textContent='copied';setTimeout(function(){b.textContent='copy'},1200)});
-var tt=document.querySelector('.totop');if(tt){var chk=function(){tt.classList.toggle('show',(window.pageYOffset||document.documentElement.scrollTop)>400)};addEventListener('scroll',chk,{passive:true});chk()}
+var tt=document.querySelector('.totop');if(tt){var secs=[].slice.call(document.querySelectorAll('main > section')),cur=null;
+var chk=function(){var y=window.pageYOffset||document.documentElement.scrollTop;cur=null;
+for(var i=0;i<secs.length;i++){if(secs[i].getBoundingClientRect().top<=70)cur=secs[i];else break}
+var atTop=!cur||Math.abs(cur.getBoundingClientRect().top-56)<24;
+tt.classList.toggle('show',y>400);tt.innerHTML=atTop?'&#8593; Page top':'&#8593; Section top'};
+addEventListener('scroll',chk,{passive:true});chk();
+tt.addEventListener('click',function(e){chk();if(cur&&!(Math.abs(cur.getBoundingClientRect().top-56)<24)){e.preventDefault();cur.scrollIntoView({block:'start'})}})}
 document.querySelectorAll('table.sortable th').forEach(function(th,i){th.onclick=function(){
 var t=th.closest('table'),tb=t.tBodies[0],dir=th.classList.contains('asc')?-1:1;
 t.querySelectorAll('th').forEach(function(x){x.classList.remove('asc','desc')});th.classList.add(dir===1?'asc':'desc');
@@ -2604,7 +2612,7 @@ def render_html(rep):
     for s in rep.sections:
         if all(it["t"] in ("kpis", "findings") for it in s["items"]):
             continue
-        parts.append('<section id="%s"><h2>%s</h2>' % (_slug(s["title"]), _e(s["title"])))
+        parts.append('<section id="%s"><h2>%s<a class="sectop" href="#top">&#8593; page top</a></h2>' % (_slug(s["title"]), _e(s["title"])))
 
         i, items = 0, s["items"]
         while i < len(items):

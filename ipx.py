@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live traceroute with a colored progress bar pinned to the bottom line.
+"""IP Tools.
 
 Probe types (none need root; Linux):
   icmp  system `ping` with a limited TTL
@@ -15,7 +15,7 @@ Extras:
   --scan     TCP/UDP port check, instead of tracing
   --open     find open ports on both TCP and UDP (confirmed-open only)
 
-Usage: path-trace.py <host> [host ...] [-P icmp|udp|tcp | -u | -T] [--port N]
+Usage: ipx.py <host> [host ...] [-P icmp|udp|tcp | -u | -T] [--port N]
                      [--asn] [--mtu] [--compare [--protos icmp,udp,tcp]] [--live]
                      [--ping [-c N]] [--scan [PORTS] [--scan-proto tcp,udp] | --open]
 """
@@ -90,7 +90,7 @@ def probe_udp(target, ttl, timeout, port):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
         sock.setsockopt(socket.SOL_IP, IP_RECVERR, 1)
         start = time.monotonic()
-        sock.sendto(b"path-trace", (target, port))
+        sock.sendto(b"ipx", (target, port))
         poller = select.poll()
         poller.register(sock, select.POLLERR | select.POLLIN)
         if not poller.poll(timeout * 1000):
@@ -719,7 +719,7 @@ def resolve(host):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Live traceroute with progress bar")
+    ap = argparse.ArgumentParser(description="IP Tools")
     ap.add_argument("hosts", nargs="+", metavar="host")
     ap.add_argument("-m", "--max-hops", type=int, default=30)
     ap.add_argument("-q", "--probes", type=int, default=3)

@@ -2156,7 +2156,7 @@ HTML_CSS = """
 --c8:#8b949e;--high:#ff6b6b;--med:#f0a53a;--info:#58a6ff;--ok:#56d364}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:1180px;margin:0 auto;padding:0 16px}
+.wrap{max-width:min(97vw,1900px);margin:0 auto;padding:0 16px}
 header.top{background:var(--head);color:#fff;padding:22px 0}
 header.top h1{margin:0 0 4px;font-size:22px;font-weight:650;letter-spacing:.2px}
 header.top .sub{color:#aab6c5;font-size:13px;word-break:break-all}
@@ -2174,20 +2174,20 @@ main{padding:20px 0 48px}
 section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:18px}
 section h2{margin:0 0 12px;font-size:16px;letter-spacing:.3px}
 h3{margin:0 0 8px;font-size:13px;color:var(--mute);font-weight:600}
-dl.kv{display:grid;grid-template-columns:minmax(180px,max-content) 1fr;gap:4px 18px;margin:0 0 12px}
+dl.kv{display:grid;grid-template-columns:minmax(200px,max-content) 1fr;gap:4px 18px;margin:0 0 12px}
 dl.kv dt{color:var(--mute)}dl.kv dd{margin:0;font-variant-numeric:tabular-nums;word-break:break-word}
 p.note{color:var(--mute);margin:6px 0;font-size:13px}
-.tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,430px),1fr));gap:14px;margin-top:6px}
-.tcard{border:1px solid var(--line);border-radius:10px;padding:10px 12px;overflow-x:auto}
+.tables{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr));gap:14px;margin-top:6px}
+.tcard{border:1px solid var(--line);border-radius:10px;padding:10px 12px;min-width:0}
 .tcard.wide{grid-column:1/-1}
 table{border-collapse:collapse;width:100%;font-size:13px}
-th,td{padding:4px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th,td{padding:4px 8px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 tr:last-child td{border-bottom:0}
 th{color:var(--mute);font-weight:600;cursor:pointer;user-select:none}
 th:hover{color:var(--ink)}th.asc::after{content:" \\25B2"}th.desc::after{content:" \\25BC"}
-td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
-td.txt{max-width:340px;overflow:hidden;text-overflow:ellipsis}
-.bar{position:relative;min-width:96px;height:18px;line-height:18px}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.txt{white-space:normal}
+.bar{position:relative;min-width:80px;height:18px;line-height:18px}
 .bar i{position:absolute;left:0;top:2px;bottom:2px;background:var(--bar);opacity:.6;border-radius:3px}
 .bar span{position:relative;display:block;text-align:right;padding-right:4px}
 .findings{display:flex;flex-direction:column;gap:8px}
@@ -2256,7 +2256,7 @@ def _nav_label(title):
     m = re.match(r"LAYER (\S+) - ([^(]+)", title)
     if m:
         return "L%s %s" % (m.group(1), m.group(2).strip().title())
-    return title.title()
+    return re.sub(r"\b(Mtu|Tcp|Udp|Ip|Tls|Dns|Http)\b", lambda m: m.group(1).upper(), title.title())
 
 
 def _e(x):
@@ -2303,7 +2303,7 @@ def _html_table(it):
     headers, rows = it["headers"], it["rows"]
     bi = bar_col(headers)
     num = [all(_numlike(r[i]) for r in rows) for i in range(len(headers))]
-    out = ['<div class="tcard%s"><h3>%s</h3><table class="sortable"><thead><tr>' % (" wide" if len(headers) >= 5 else "", _e(it["title"]))]
+    out = ['<div class="tcard%s"><h3>%s</h3><table class="sortable"><thead><tr>' % (" wide" if len(headers) >= 4 else "", _e(it["title"]))]
     for i, h in enumerate(headers):
         out.append('<th class="%s">%s</th>' % ("num" if num[i] else "", _e(h)))
     out.append("</tr></thead><tbody>")

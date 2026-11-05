@@ -2167,7 +2167,10 @@ nav a{color:var(--mute);text-decoration:none;white-space:nowrap;padding:4px 10px
 nav a:hover{background:var(--bg);color:var(--ink)}
 main{padding:20px 0 48px}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
-.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.kpi{display:block;color:inherit;text-decoration:none;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;transition:border-color .15s,box-shadow .15s}
+a.kpi:hover{border-color:var(--c1);box-shadow:0 1px 8px rgba(37,99,235,.18)}
+a.lg{color:inherit;text-decoration:none;border-bottom:1px dotted var(--mute)}a.lg:hover{color:var(--c1);border-bottom-style:solid}
+.donut a circle:hover{opacity:.75}
 .kpi .l{font-size:12px;color:var(--mute);text-transform:uppercase;letter-spacing:.5px}
 .kpi .v{font-size:24px;font-weight:650;font-variant-numeric:tabular-nums;margin:2px 0}
 .kpi .s{font-size:12px;color:var(--mute)}
@@ -2328,7 +2331,8 @@ def _html_table(it):
                 out.append('<td class="num"%s><div class="bar"><i style="width:%.1f%%"></i><span>%s</span></div></td>'
                            % (dv, min(100.0, pct_value(c) * 100), _e(c)))
             else:
-                out.append('<td class="%s"%s title="%s">%s</td>' % ("num" if num[i] else "txt", dv, _e(c), linkify_cell(c)))
+                out.append('<td class="%s"%s title="%s">%s</td>' % ("num" if num[i] else "txt", dv, _e(c),
+                                                                    linkify(c) if headers[i] == "IP addresses" else linkify_cell(c)))
         out.append("</tr>")
     out.append("</tbody></table></div>")
     return "".join(out)
@@ -2361,7 +2365,7 @@ def _svg_timeline(per_second):
     return "".join(out)
 
 
-def _svg_donut(title, pairs):
+def _svg_donut(title, pairs, href_for=None):
     total = sum(v for _, v in pairs) or 1
     top7 = pairs[:7]
     rest = sum(v for _, v in pairs[7:])
@@ -2373,10 +2377,14 @@ def _svg_donut(title, pairs):
     for i, (lab, v) in enumerate(top7):
         ln = circ * v / total
         col = "var(--c%d)" % (i % 8 + 1)
-        segs.append('<circle r="%d" cx="75" cy="75" fill="none" stroke="%s" stroke-width="%d" stroke-dasharray="%.2f %.2f" '
-                    'stroke-dashoffset="%.2f" transform="rotate(-90 75 75)"><title>%s: %s (%.1f%%)</title></circle>'
-                    % (r, col, sw, max(0.0, ln - 1.0), circ - max(0.0, ln - 1.0), -cum, _e(lab), "{:,}".format(v), 100.0 * v / total))
-        legend.append('<li><b style="background:%s"></b>%s<em>%.1f%%</em></li>' % (col, _e(lab), 100.0 * v / total))
+        href = href_for(lab) if href_for else None
+        circle = ('<circle r="%d" cx="75" cy="75" fill="none" stroke="%s" stroke-width="%d" stroke-dasharray="%.2f %.2f" '
+                  'stroke-dashoffset="%.2f" transform="rotate(-90 75 75)"%s><title>%s: %s (%.1f%%)%s</title></circle>'
+                  % (r, col, sw, max(0.0, ln - 1.0), circ - max(0.0, ln - 1.0), -cum, ' style="cursor:pointer"' if href else "",
+                     _e(lab), "{:,}".format(v), 100.0 * v / total, " - click to open the related section" if href else ""))
+        segs.append('<a href="%s">%s</a>' % (href, circle) if href else circle)
+        name = '<a class="lg" href="%s">%s</a>' % (href, _e(lab)) if href else _e(lab)
+        legend.append('<li><b style="background:%s"></b>%s<em>%.1f%%</em></li>' % (col, name, 100.0 * v / total))
         cum += ln
     return ('<div class="donut"><svg viewBox="0 0 150 150" role="img" aria-label="%s">%s<text class="c" x="75" y="76">%s</text>'
             '<text class="c2" x="75" y="90">packets</text></svg><div><h3>%s</h3><ul class="legend">%s</ul></div></div>'
@@ -2593,6 +2601,23 @@ def render_html(rep):
     parts.append('<header class="top" id="top"><div class="wrap"><button class="theme" type="button">Theme</button>'
                  '<h1>Packet capture report</h1><div class="sub">%s &middot; %s &middot; generated %s</div></div></header>'
                  % (_e(meta.get("path", "")), _e(meta.get("format", "")), _e(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))))
+    def sec_id(prefix):
+        return next((_slug(s["title"]) for s in rep.sections if s["title"].startswith(prefix)), None)
+    ids = {k: sec_id(v) for k, v in (("hier", "PROTOCOL HIERARCHY"), ("l1", "LAYER 1"), ("l2", "LAYER 2"), ("l3", "LAYER 3"),
+                                     ("l4", "LAYER 4"), ("tls", "LAYER 5-6"), ("l7", "LAYER 7"), ("hosts", "HOSTS"))}
+    proto_sec = {}
+    for names, key in ((("ARP", "LLC", "STP", "LLDP", "CDP", "VLAN", "SLL", "SLL2", "NULL", "RAW", "ETH"), "l2"),
+                       (("IP", "IPV6", "ICMP", "ICMPV6", "IGMP", "GRE", "ESP", "AH", "IP-FRAG"), "l3"),
+                       (("TCP", "UDP", "SCTP"), "l4"), (("TLS", "HTTPS", "QUIC", "WIREGUARD"), "tls"),
+                       (("DNS", "MDNS", "HTTP", "DHCP", "NTP", "SSH", "FTP", "SMTP", "SSDP", "SNMP", "SYSLOG", "POP3", "IMAP",
+                         "TELNET", "SIP", "NBNS", "NBDGM", "SMB", "HTTP-ALT", "DOMAIN"), "l7")):
+        for n in names:
+            proto_sec[n] = key
+
+    def href_for(label):
+        key = proto_sec.get(label.upper(), "hier")
+        return "#" + ids[key] if ids.get(key) else None
+    kpi_target = {"PACKETS": "hier", "DATA": "l1", "DURATION": "l1", "HOSTS": "hosts", "FLOWS": "l4"}
     nav = [("findings", "Findings")] + [(_slug(s["title"]), _nav_label(s["title"])) for s in rep.sections
                                           if not all(it["t"] in ("kpis", "findings") for it in s["items"])]
     parts.append('<nav><div class="wrap">%s</div></nav>' % "".join(
@@ -2602,12 +2627,13 @@ def render_html(rep):
         for it in s["items"]:
             if it["t"] == "kpis":
                 parts.append('<div class="kpis">%s</div>' % "".join(
-                    '<div class="kpi"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></div>'
-                    % (_e(l), _e(v), _e(sub)) for l, v, sub in it["items"]))
+                    '<a class="kpi" href="#%s"><div class="l">%s</div><div class="v">%s</div><div class="s">%s</div></a>'
+                    % (ids.get(kpi_target.get(l)) or "findings" if l != "FINDINGS" else "findings", _e(l), _e(v), _e(sub))
+                    for l, v, sub in it["items"]))
             elif it["t"] == "findings":
                 body = ('<div class="finding"><span class="ok">&#10004;</span><span>Nothing notable found by the built-in checks.</span></div>'
                         if not it["items"] else "".join(_html_finding(x) for x in it["items"]))
-                parts.append('<section id="findings"><h2>Findings <span class="note" style="font-weight:400;color:var(--mute)">'
+                parts.append('<section id="findings"><h2 style="display:block">Findings <span class="note" style="font-weight:400;color:var(--mute)">'
                              '(heuristics - verify before acting)</span></h2><div class="findings">%s</div></section>' % body)
     for s in rep.sections:
         if all(it["t"] in ("kpis", "findings") for it in s["items"]):
@@ -2635,7 +2661,7 @@ def render_html(rep):
             if t == "donut":
                 ds = []
                 while i < len(items) and items[i]["t"] == "donut":
-                    ds.append(_svg_donut(items[i]["title"], items[i]["pairs"]))
+                    ds.append(_svg_donut(items[i]["title"], items[i]["pairs"], href_for))
                     i += 1
                 parts.append('<div class="donuts">%s</div>' % "".join(ds))
                 continue
@@ -2836,8 +2862,11 @@ def build_report(a, path, topn, whois=None, traces=None, filter_desc=None):
             nets[key][0] += v
             nets[key][1] += tot_ip[ip]
             nets[key][2].add(ip)
-        R.table(s, "Top networks / organisations (whois, by bytes)", ["Network", "IPs", "Packets", "Bytes", "% of traffic"],
-                [(k, len(v[2]), "{:,}".format(v[1]), human_bytes(v[0]), pct(v[0], sum(tb.values())))
+        def ip_list(members, limit=12):
+            ordered = sorted(members, key=lambda x: -tb[x])
+            return ", ".join(ordered[:limit]) + (" +%d more" % (len(ordered) - limit) if len(ordered) > limit else "")
+        R.table(s, "Top networks / organisations (whois, by bytes)", ["Network", "IPs", "IP addresses", "Packets", "Bytes", "% of traffic"],
+                [(k, len(v[2]), ip_list(v[2]), "{:,}".format(v[1]), human_bytes(v[0]), pct(v[0], sum(tb.values())))
                  for k, v in sorted(nets.items(), key=lambda kv: -kv[1][0])[:topn]])
     R.table(s, "Top conversations (IP pairs, by bytes)", ["Host A", "Host B", "Packets", "Bytes"],
             [(x, y, "{:,}".format(a.conv_p[(x, y)]), human_bytes(v)) for (x, y), v in a.conv_b.most_common(topn)])

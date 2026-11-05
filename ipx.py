@@ -742,7 +742,7 @@ def main():
     ap.add_argument("--count", type=int, default=0, help="live mode: stop after N rounds (0 = forever)")
     ap.add_argument("--ping", action="store_true",
                     help="ping the host (ICMP, or TCP connects with -T) instead of tracing")
-    ap.add_argument("-c", "--ping-count", type=int, default=10, help="ping: number of probes")
+    ap.add_argument("-c", "--ping-count", type=int, default=5, help="ping: number of probes (default 5)")
     ap.add_argument("--scan", nargs="?", const="top", metavar="PORTS",
                     help="port check instead of tracing: 'top' (default), or e.g. 22,80,8000-8100")
     ap.add_argument("--scan-proto", default=None, metavar="PROTO",

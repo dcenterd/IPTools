@@ -25,6 +25,9 @@ Usage
     ./iplookup.py 8.8.8.8            # no questions asked
     ./iplookup.py 8.8.8.8 --prefixes # also list all IPv4 prefixes of the ASN
     ./iplookup.py 8.8.8.8 --json     # one JSON document on stdout, for scripts
+    ./iplookup.py --download-db      # fetch the offline databases (~55 MB) once
+    ./iplookup.py --update-db        # re-download them to refresh
+    ./iplookup.py 8.8.8.8 --offline  # query the local databases, no network
     ./iplookup.py 8.8.8.8 --save     # also write AS<number>_prefixes.txt (nothing is saved by default)
     echo 8.8.8.8 | ./iplookup.py     # piped input works too
 
@@ -38,6 +41,19 @@ Output
     warnings go to stderr, errors become {"error": ...} with exit code 1).
     --json never prompts.
 
+Offline mode
+    --download-db fetches two public databases into ~/.cache/iplookup/ (or
+    --db-dir): iptoasn.com ip2asn-combined (IP range -> ASN, AS name, country)
+    and the NRO combined delegated stats (IP/ASN -> RIR, country, status).
+    --update-db re-downloads them (the old copy is kept if a download fails);
+    a warning is printed when they are over 7 days old. --offline then answers
+    from those files without any network access. It reports RIR, prefix, ASN,
+    holder, country codes and (with --prefixes/--save/--json) all prefixes of
+    the ASN. Not available offline: geolocation, neighbours, reverse DNS, and
+    registry net name / org. The prefix is the CIDR block of the originating
+    ASN range that contains the IP, which can be larger or smaller than the
+    announced BGP prefix. IPs with no route show the RIR allocation instead.
+
 Data source
     RIPEstat public API (https://stat.ripe.net/data): network-info,
     as-overview, asn-neighbours, geoloc, announced-prefixes, whois (also gives the RIR) and rir-geo.
@@ -47,10 +63,14 @@ Requirements
 """
 
 import argparse
+import datetime
+import gzip
 import ipaddress
 import json
+import os
 import socket
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -185,6 +205,7 @@ def lookup(ip):
     asns = network.get("asns", [])
     data = {
         "ip": ip,
+        "source": "ripestat",
         "bgp_prefix": network.get("prefix") if asns else None,
         "announced": bool(asns),
         "asn": f"AS{asns[0]}" if asns else None,
@@ -224,8 +245,228 @@ def lookup(ip):
     return data
 
 
+# ---------------------------------------------------------------------------
+# Offline mode: local copies of two public databases instead of RIPEstat.
+#   ip2asn  - iptoasn.com: IP range -> origin ASN, country, AS name (IPv4+IPv6)
+#   nro     - NRO combined delegated stats (all five RIRs): IP/ASN -> RIR, country, status
+# ---------------------------------------------------------------------------
+
+DB_FILES = {
+    "ip2asn": ("https://iptoasn.com/data/ip2asn-combined.tsv.gz", "ip2asn-combined.tsv.gz"),
+    "nro": ("https://ftp.ripe.net/pub/stats/ripencc/nro-stats/latest/nro-delegated-stats", "nro-delegated-stats"),
+}
+DEFAULT_DB_DIR = os.path.join(os.path.expanduser("~"), ".cache", "iplookup")
+STALE_DAYS = 7
+NRO_REGISTRIES = {"ripencc": "RIPE NCC", "arin": "ARIN", "apnic": "APNIC", "lacnic": "LACNIC",
+                  "afrinic": "AFRINIC", "iana": "IANA", "ietf": "IANA"}
+
+
+def db_path(db_dir, name):
+    return os.path.join(db_dir, DB_FILES[name][1])
+
+
+def _progress(done, total, started, label):
+    """Draw a one-line progress bar on stderr (only when stderr is a terminal)."""
+    if not sys.stderr.isatty():
+        return
+    speed = done / max(time.time() - started, 0.001)
+    if total:
+        frac = min(done / total, 1.0)
+        filled = int(frac * 30)
+        bar = "#" * filled + "-" * (30 - filled)
+        eta = f"  ETA {int((total - done) / speed)}s" if speed and done < total else ""
+        line = f"{label}  [{bar}] {frac * 100:5.1f}%  {done / 1e6:.1f}/{total / 1e6:.1f} MB  {speed / 1e6:.1f} MB/s{eta}"
+    else:
+        line = f"{label}  {done / 1e6:.1f} MB  {speed / 1e6:.1f} MB/s"   # server sent no size
+    sys.stderr.write("\r" + line.ljust(100))
+    sys.stderr.flush()
+
+
+def download_db(db_dir, force=False):
+    """Download the offline databases into db_dir. Existing files are kept unless force. True on success."""
+    try:
+        os.makedirs(db_dir, exist_ok=True)
+    except OSError as e:
+        print(f"ERROR: cannot create {db_dir}: {e}", file=sys.stderr)
+        return False
+
+    ok = True
+    for name, (url, filename) in DB_FILES.items():
+        path = os.path.join(db_dir, filename)
+        if os.path.exists(path) and not force:
+            print(f"{filename}: already present (use --update-db to refresh)", file=sys.stderr)
+            continue
+        print(f"Downloading {url} ...", file=sys.stderr)
+        tmp = path + ".part"
+        try:
+            with requests.get(url, stream=True, timeout=60) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length") or 0)
+                done, started = 0, time.time()
+                with open(tmp, "wb") as f:
+                    for chunk in resp.iter_content(64 * 1024):
+                        f.write(chunk)
+                        done += len(chunk)
+                        _progress(done, total, started, filename)
+            if sys.stderr.isatty():
+                sys.stderr.write("\r" + " " * 100 + "\r")
+            os.replace(tmp, path)   # only replace the old copy once the new one is complete
+            print(f"{filename}: {os.path.getsize(path) / 1e6:.1f} MB", file=sys.stderr)
+        except (requests.RequestException, OSError) as e:
+            if sys.stderr.isatty():
+                sys.stderr.write("\n")
+            print(f"ERROR: could not download {url}: {e}", file=sys.stderr)
+            ok = False
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return ok
+
+
+def _addr_int(text, version):
+    return int.from_bytes(socket.inet_pton(socket.AF_INET6 if version == 6 else socket.AF_INET, text), "big")
+
+
+def _cc(value):
+    value = (value or "").strip()
+    return None if value.upper() in ("", "ZZ", "NONE", "*") else value.upper()
+
+
+def _range_prefixes(start, end, version):
+    cls = ipaddress.IPv6Address if version == 6 else ipaddress.IPv4Address
+    return [str(n) for n in ipaddress.summarize_address_range(cls(start), cls(end))]
+
+
+def _scan_ip2asn(path, ip_int, version):
+    """Row of the ip2asn file that contains the IP: (start, end, asn, country, name) or None."""
+    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 5 or (":" in p[0]) != (version == 6):
+                continue
+            try:
+                start, end = _addr_int(p[0], version), _addr_int(p[1], version)
+            except (OSError, ValueError):
+                continue
+            if start <= ip_int <= end:
+                return start, end, int(p[2]), _cc(p[3]), p[4]
+    return None
+
+
+def _asn_ranges(path, asn):
+    """Every (start, end, version) range originated by asn in the ip2asn file."""
+    out = []
+    with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 5 or p[2] != str(asn):
+                continue
+            v = 6 if ":" in p[0] else 4
+            try:
+                out.append((_addr_int(p[0], v), _addr_int(p[1], v), v))
+            except (OSError, ValueError):
+                continue
+    return out
+
+
+def _scan_nro(path, ip_int, version, asn):
+    """RIR rows for the IP block and (if asn) the ASN: (ip_row, asn_row); each is a dict or None."""
+    ip_row = asn_row = None
+    want = "ipv6" if version == 6 else "ipv4"
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("|")
+            if len(p) < 7 or p[3] == "*":
+                continue
+            kind = p[2]
+            try:
+                if kind == want and ip_row is None:
+                    start = _addr_int(p[3], version)
+                    size = 1 << (128 - int(p[4])) if version == 6 else int(p[4])
+                    if start <= ip_int < start + size:
+                        ip_row = {"rir": NRO_REGISTRIES.get(p[0].lower(), p[0]), "country": _cc(p[1]),
+                                  "status": p[6], "start": start, "end": start + size - 1}
+                elif kind == "asn" and asn is not None and asn_row is None:
+                    start, size = int(p[3]), int(p[4])
+                    if start <= asn < start + size:
+                        asn_row = {"rir": NRO_REGISTRIES.get(p[0].lower(), p[0]), "country": _cc(p[1])}
+            except (OSError, ValueError):
+                continue
+            if ip_row and (asn_row or asn is None):
+                break
+    return ip_row, asn_row
+
+
+def offline_lookup(ip, db_dir, want_prefixes=False):
+    """Same result dict as lookup(), built from the local databases (no network)."""
+    paths = {name: db_path(db_dir, name) for name in DB_FILES}
+    if not all(os.path.exists(x) for x in paths.values()):
+        raise LookupError(f"Offline databases not found in {db_dir}. Download them first with: iplookup.py --download-db")
+
+    oldest = min(os.path.getmtime(x) for x in paths.values())
+    age_days = (time.time() - oldest) / 86400
+    if age_days > STALE_DAYS:
+        print(f"WARNING: offline databases are {int(age_days)} days old; refresh with --update-db", file=sys.stderr)
+
+    ip_obj = ipaddress.ip_address(ip)
+    version, ip_int = ip_obj.version, int(ip_obj)
+    try:
+        row = _scan_ip2asn(paths["ip2asn"], ip_int, version)
+        asn = row[2] if row and row[2] else None      # ASN 0 = not routed
+        ip_row, asn_row = _scan_nro(paths["nro"], ip_int, version, asn)
+    except (OSError, EOFError) as e:
+        raise LookupError(f"Could not read offline databases ({e}). Try --update-db.")
+
+    data = {
+        "ip": ip,
+        "source": "offline",
+        "db_date": datetime.date.fromtimestamp(oldest).isoformat(),
+        "bgp_prefix": None,
+        "announced": asn is not None,
+        "asn": f"AS{asn}" if asn else None,
+        "holder": row[4] if asn else None,
+        "rir": ip_row["rir"] if ip_row else None,
+        "ip_country": (ip_row and ip_row["country"]) or (row[3] if row else None),
+        "asn_country": (asn_row and asn_row["country"]) or None,
+        "location": None,
+        "neighbours": None,
+        "announcing": None,
+        "reverse_dns": None,
+        "registry": None,
+        "prefixes": {"ipv4": [], "ipv6": []},
+    }
+
+    if asn is None:
+        block = None
+        if ip_row:
+            cls = ipaddress.IPv6Address if version == 6 else ipaddress.IPv4Address
+            block = f"{cls(ip_row['start'])} - {cls(ip_row['end'])}"
+        data["registry"] = {"block": block, "net_name": None, "country": data["ip_country"],
+                            "org": None, "status": ip_row["status"] if ip_row else None, "rir_geo": None}
+        return data
+
+    # The database holds ranges, not announced prefixes: report the CIDR block
+    # inside the originating range that contains the IP.
+    data["bgp_prefix"] = next(
+        (c for c in _range_prefixes(row[0], row[1], version) if ip_obj in ipaddress.ip_network(c)), None)
+
+    if want_prefixes:
+        try:
+            ranges = _asn_ranges(paths["ip2asn"], asn)
+        except (OSError, EOFError) as e:
+            raise LookupError(f"Could not read offline databases ({e}). Try --update-db.")
+        cidrs = [c for s, e, v in ranges for c in _range_prefixes(s, e, v)]
+        v4, v6 = sort_prefixes(cidrs)
+        data["prefixes"] = {"ipv4": v4, "ipv6": v6}
+    return data
+
+
 def render(d, show_prefixes=False):
     """Print the dict returned by lookup() as a short key/value report."""
+    offline_mode = d.get("source") == "offline"
     rows = [("IP", d["ip"]), ("RIR", d["rir"] or "Unknown")]
 
     if d["announced"]:
@@ -240,26 +481,32 @@ def render(d, show_prefixes=False):
         reg = d["registry"]
         rows.append(("Prefix", "not announced in BGP"))
         if reg["block"]:
-            rows += [
-                ("Block", reg["block"]),
-                ("Net name", reg["net_name"] or "Unknown"),
-                ("Country", reg["country"] or "Unknown"),
-                ("Org", reg["org"] or "Unknown"),
-                ("Status", reg["status"] or "Unknown"),
-            ]
+            # the offline database has no net name / org, so leave those rows out
+            rows += [("Block", reg["block"])]
+            if not offline_mode:
+                rows += [("Net name", reg["net_name"] or "Unknown")]
+            rows += [("Country", reg["country"] or "Unknown")]
+            if not offline_mode:
+                rows += [("Org", reg["org"] or "Unknown")]
+            rows += [("Status", reg["status"] or "Unknown")]
         else:
             rows.append(("Registry", "no whois record found"))
         if reg["rir_geo"]:
             rows.append(("RIR geo", f"{reg['rir_geo']['location'] or 'Unknown'} ({reg['rir_geo']['resource']})"))
 
     loc = d["location"]
-    if loc:
+    if offline_mode:
+        pass
+    elif loc:
         place = ", ".join(x for x in (loc["city"], loc["country"]) if x) or "Unknown"
         rows.append(("Geolocation", f"{place} ({loc['latitude']}, {loc['longitude']})"))
     else:
         rows.append(("Geolocation", "Unknown"))
 
-    rows.append(("rDNS", d["reverse_dns"] or "none"))
+    if offline_mode:
+        rows.append(("Source", f"offline databases from {d['db_date']}"))
+    else:
+        rows.append(("rDNS", d["reverse_dns"] or "none"))
 
     width = max(len(k) for k, _ in rows)
     for k, v in rows:
@@ -321,11 +568,22 @@ def main():
     ap.add_argument("--prefixes", action="store_true", help="also print every IPv4 prefix announced by the ASN (hidden by default)")
     ap.add_argument("--json",action="store_true", help="print one JSON document instead of the text report (never prompts)")
     ap.add_argument("--save", action="store_true", help="write AS<number>_prefixes.txt in the current directory (nothing is saved by default)")
+    ap.add_argument("--offline", action="store_true", help="query the local databases instead of RIPEstat (no network; see --download-db)")
+    ap.add_argument("--download-db", action="store_true", help="download the offline databases if missing, then exit (or continue if an IP is given)")
+    ap.add_argument("--update-db", action="store_true", help="re-download the offline databases even if present, then exit (or continue if an IP is given)")
+    ap.add_argument("--db-dir", default=DEFAULT_DB_DIR, help="where the offline databases live (default: ~/.cache/iplookup)")
     args = ap.parse_args()
 
     def fail(msg):
         print(json.dumps({"error": msg}) if args.json else msg)
         return 1
+
+    if args.download_db or args.update_db:
+        if not download_db(args.db_dir, force=args.update_db):
+            return 1
+        if not args.ip:
+            print(f"Offline databases ready in {args.db_dir}", file=sys.stderr)
+            return 0
 
     if args.ip:
         ip = args.ip.strip()
@@ -339,11 +597,14 @@ def main():
     except ValueError:
         return fail("Invalid IP address.")
 
-    if not args.json:
+    if not args.json and not args.offline:
         print("Querying RIPEstat...", file=sys.stderr)
 
     try:
-        data = lookup(ip)
+        if args.offline:
+            data = offline_lookup(ip, args.db_dir, want_prefixes=args.prefixes or args.save or args.json)
+        else:
+            data = lookup(ip)
     except LookupError as e:
         return fail(str(e))
 

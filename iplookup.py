@@ -7,11 +7,15 @@ Updated: 2026-10-27
 
 What it does
     Reports, for an IP address (IPv4 or IPv6):
-      1. BGP prefix and origin ASN that announces the IP
-      2. ASN holder (the organisation that owns the AS)
-      3. Reverse DNS (PTR) hostname
-      4. Every IPv4 / IPv6 prefix announced by that ASN (on screen only with
-         --prefixes; always saved to the file and included in --json)
+      1. The RIR (RIPE NCC, ARIN, APNIC, LACNIC, AFRINIC) that manages the IP
+      2. BGP prefix and origin ASN that announces the IP
+      3. ASN holder (the organisation that owns the AS)
+      4. Country code of the IP and of the announcing ASN (RIR delegation data)
+      5. City-level geolocation of the IP (RIPEstat geoloc)
+      6. Upstream / downstream counts and the top 5 upstream ASNs
+      7. Reverse DNS (PTR) hostname
+      8. Every IPv4 / IPv6 prefix announced by that ASN (on screen only with
+         --prefixes; saved with --save, always included in --json)
 
     If the IP is not announced in BGP (no ASN), it shows the registry (whois)
     record instead: block, net name, country, org and allocation status.
@@ -21,21 +25,22 @@ Usage
     ./iplookup.py 8.8.8.8            # no questions asked
     ./iplookup.py 8.8.8.8 --prefixes # also list all IPv4 prefixes of the ASN
     ./iplookup.py 8.8.8.8 --json     # one JSON document on stdout, for scripts
-    ./iplookup.py 8.8.8.8 --no-save  # do not write the AS<number>_prefixes.txt file
+    ./iplookup.py 8.8.8.8 --save     # also write AS<number>_prefixes.txt (nothing is saved by default)
     echo 8.8.8.8 | ./iplookup.py     # piped input works too
 
 Output
     Printed on screen (the announced prefix containing the queried IP is
-    shown in red when output is a terminal), and saved as AS<number>_prefixes.txt in the current
+    shown in red when output is a terminal). Nothing is written to disk unless
+    --save is given, which saves AS<number>_prefixes.txt in the current
     directory (for example AS15169_prefixes.txt).
 
     With --json a single JSON document is printed instead (progress and
-    warnings go to stderr, errors become {"error": ...} with exit code 1) and
-    no file is written unless --save is given. --json never prompts.
+    warnings go to stderr, errors become {"error": ...} with exit code 1).
+    --json never prompts.
 
 Data source
     RIPEstat public API (https://stat.ripe.net/data): network-info,
-    as-overview, announced-prefixes, whois and rir-geo.
+    as-overview, asn-neighbours, geoloc, announced-prefixes, whois (also gives the RIR) and rir-geo.
 
 Requirements
     Python 3 and the 'requests' module. Needs internet access.
@@ -46,6 +51,7 @@ import ipaddress
 import json
 import socket
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -83,28 +89,77 @@ def reverse_dns(ip):
         return None
 
 
-def registry_info(ip):
-    """What the RIR/whois database says about an IP with no BGP route."""
-    whois = ripe_query("whois", ip)
+RIR_NAMES = {"ripe": "RIPE NCC", "arin": "ARIN", "apnic": "APNIC", "lacnic": "LACNIC", "afrinic": "AFRINIC"}
 
-    # Each record group is a list of {key, value}; the first one with an
-    # inetnum/inet6num key is the block that covers the IP.
-    block = {}
-    for group in whois.get("records", []):
-        keys = {r["key"]: r["value"] for r in group}
-        if "inetnum" in keys or "inet6num" in keys:
-            block = keys
-            break
+
+def rir_name(whois):
+    """Name of the RIR that manages the IP, from the whois 'authorities' field."""
+    for a in whois.get("authorities", []):
+        a = a.lower()
+        for key, name in RIR_NAMES.items():
+            if a.startswith(key):
+                return name
+    return None
+
+
+def registry_info(whois, ip):
+    """What the RIR/whois database says about an IP with no BGP route."""
+
+    # Each record group is a list of {key, value}. RIPE-style registries
+    # (RIPE, APNIC, AFRINIC, LACNIC) use inetnum/inet6num/netname/country/org/status;
+    # ARIN uses NetRange/CIDR/NetName/Organization/NetType, and puts the country
+    # in a separate OrgName record, so look for it in any group.
+    groups = [{r["key"]: r["value"] for r in group} for group in whois.get("records", [])]
+    block = next((k for k in groups if "inetnum" in k or "inet6num" in k or "NetRange" in k), {})
+    country = block.get("country") or block.get("Country") or next(
+        (k["Country"] for k in groups if k.get("Country")), None)
 
     geo = ripe_query("rir-geo", ip).get("located_resources", [])
 
     return {
-        "block": (block.get("inetnum") or block.get("inet6num")) if block else None,
-        "net_name": block.get("netname"),
-        "country": block.get("country"),
-        "org": block.get("org"),
-        "status": block.get("status"),
+        "block": (block.get("inetnum") or block.get("inet6num") or block.get("CIDR") or block.get("NetRange")) if block else None,
+        "net_name": block.get("netname") or block.get("NetName"),
+        "country": country,
+        "org": block.get("org") or block.get("Organization"),
+        "status": block.get("status") or block.get("NetType"),
         "rir_geo": {"location": geo[0].get("location"), "resource": geo[0].get("resource")} if geo else None,
+    }
+
+
+def rir_country(resource):
+    """Country code the RIR delegation files assign to an IP/prefix/ASN, or None."""
+    geo = ripe_query("rir-geo", resource).get("located_resources", [])
+    return geo[0].get("location") if geo else None
+
+
+def geolocate(ip):
+    """City-level location (RIPEstat geoloc, MaxMind-based) as a dict, or None."""
+    for res in ripe_query("geoloc", ip).get("located_resources", []):
+        locs = res.get("locations") or []
+        if locs:
+            loc = max(locs, key=lambda x: x.get("covered_percentage", 0))
+            return {
+                "country": loc.get("country") or None,
+                "city": loc.get("city") or None,
+                "latitude": loc.get("latitude"),
+                "longitude": loc.get("longitude"),
+            }
+    return None
+
+
+def neighbours(asn, top=5):
+    """Upstream/downstream counts and the busiest upstreams of an ASN (RIPEstat asn-neighbours)."""
+    data = ripe_query("asn-neighbours", asn)
+    items = data.get("neighbours", [])
+    counts = data.get("neighbour_counts", {})
+    # 'left' = upstream (provider side), 'right' = downstream (customer side)
+    ups = sorted((n for n in items if n.get("type") == "left"), key=lambda n: -n.get("power", 0))[:top]
+    with ThreadPoolExecutor(max_workers=top) as pool:
+        holders = list(pool.map(lambda n: ripe_query("as-overview", f"AS{n['asn']}").get("holder"), ups))
+    return {
+        "upstream_count": counts.get("left"),
+        "downstream_count": counts.get("right"),
+        "top_upstreams": [{"asn": f"AS{n['asn']}", "holder": h, "power": n.get("power")} for n, h in zip(ups, holders)],
     }
 
 
@@ -134,17 +189,29 @@ def lookup(ip):
         "announced": bool(asns),
         "asn": f"AS{asns[0]}" if asns else None,
         "holder": None,
+        "rir": None,
+        "ip_country": None,
+        "asn_country": None,
+        "location": geolocate(ip),
+        "neighbours": None,
         "announcing": None,
         "reverse_dns": reverse_dns(ip),
         "registry": None,
         "prefixes": {"ipv4": [], "ipv6": []},
     }
 
+    whois = ripe_query("whois", ip)
+    data["rir"] = rir_name(whois)
+
     if not asns:
         # Not announced in BGP: there is no ASN or prefix to report, but the
         # registry (RIPE database) still knows who the block belongs to.
-        data["registry"] = registry_info(ip)
+        data["registry"] = registry_info(whois, ip)
         return data
+
+    data["neighbours"] = neighbours(data["asn"])
+    data["ip_country"] = rir_country(ip)
+    data["asn_country"] = rir_country(data["asn"])
 
     overview = ripe_query("as-overview", data["asn"])
     data["holder"] = overview.get("holder")
@@ -159,13 +226,15 @@ def lookup(ip):
 
 def render(d, show_prefixes=False):
     """Print the dict returned by lookup() as a short key/value report."""
-    rows = [("IP", d["ip"])]
+    rows = [("IP", d["ip"]), ("RIR", d["rir"] or "Unknown")]
 
     if d["announced"]:
         rows += [
             ("Prefix", d["bgp_prefix"] or "Unknown"),
             ("ASN", d["asn"]),
             ("Holder", d["holder"] or "Unknown"),
+            ("IP country", d["ip_country"] or "Unknown"),
+            ("ASN country", d["asn_country"] or "Unknown"),
         ]
     else:
         reg = d["registry"]
@@ -183,11 +252,24 @@ def render(d, show_prefixes=False):
         if reg["rir_geo"]:
             rows.append(("RIR geo", f"{reg['rir_geo']['location'] or 'Unknown'} ({reg['rir_geo']['resource']})"))
 
+    loc = d["location"]
+    if loc:
+        place = ", ".join(x for x in (loc["city"], loc["country"]) if x) or "Unknown"
+        rows.append(("Geolocation", f"{place} ({loc['latitude']}, {loc['longitude']})"))
+    else:
+        rows.append(("Geolocation", "Unknown"))
+
     rows.append(("rDNS", d["reverse_dns"] or "none"))
 
     width = max(len(k) for k, _ in rows)
     for k, v in rows:
         print(f"{k:<{width}} : {v}")
+
+    nb = d["neighbours"]
+    if nb:
+        print(f"\nNeighbours: {nb['upstream_count']} upstream, {nb['downstream_count']} downstream")
+        for n in nb["top_upstreams"]:
+            print(f"  {n['asn']:<10} {n['holder'] or 'Unknown'}")
 
     if not (show_prefixes and d["announced"]):
         return
@@ -209,9 +291,14 @@ def save(d, filename):
     v4, v6 = d["prefixes"]["ipv4"], d["prefixes"]["ipv6"]
     with open(filename, "w") as f:
         f.write(f"IP Address: {d['ip']}\n")
+        f.write(f"RIR: {d['rir'] or 'Unknown'}\n")
         f.write(f"BGP Prefix: {d['bgp_prefix']}\n")
         f.write(f"ASN: {d['asn']}\n")
         f.write(f"Holder: {d['holder'] or 'Unknown'}\n")
+        f.write(f"IP Country: {d['ip_country'] or 'Unknown'}\n")
+        f.write(f"ASN Country: {d['asn_country'] or 'Unknown'}\n")
+        if d["location"]:
+            f.write(f"Geolocation: {d['location']['city'] or '-'}, {d['location']['country']} ({d['location']['latitude']}, {d['location']['longitude']})\n")
         f.write(f"Reverse DNS: {d['reverse_dns'] or 'No reverse DNS record'}\n\n")
 
         f.write("=" * 60 + "\n")
@@ -233,8 +320,7 @@ def main():
     ap.add_argument("ip", nargs="?", help="IPv4 or IPv6 address (asked for if omitted)")
     ap.add_argument("--prefixes", action="store_true", help="also print every IPv4 prefix announced by the ASN (hidden by default)")
     ap.add_argument("--json",action="store_true", help="print one JSON document instead of the text report (never prompts)")
-    ap.add_argument("--no-save", action="store_true", help="do not write AS<number>_prefixes.txt")
-    ap.add_argument("--save", action="store_true", help="with --json: also write AS<number>_prefixes.txt")
+    ap.add_argument("--save", action="store_true", help="write AS<number>_prefixes.txt in the current directory (nothing is saved by default)")
     args = ap.parse_args()
 
     def fail(msg):
@@ -261,7 +347,7 @@ def main():
     except LookupError as e:
         return fail(str(e))
 
-    do_save = data["announced"] and not args.no_save and (args.save or not args.json)
+    do_save = data["announced"] and args.save
     filename = f"{data['asn']}_prefixes.txt" if do_save else None
     if filename:
         save(data, filename)

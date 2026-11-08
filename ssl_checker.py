@@ -7,8 +7,11 @@ Usage:
   ssl_checker.py example.com https://github.com:443
   ssl_checker.py -f sites.txt --warn-days 30
   ssl_checker.py -f sites.txt --webhook https://hooks.slack.com/services/XXX
+  ssl_checker.py -f sites.txt --webhook telegram://123456:ABC-DEF@-1001234567890 --webhook https://discord.com/api/webhooks/...
   ssl_checker.py -f sites.txt --email you@example.com --smtp-host smtp.gmail.com \\
       --smtp-port 587 --smtp-user you@gmail.com --smtp-pass APP_PASSWORD
+
+  ssl_checker.py -f sites.txt --check-revocation --webhook ...
 
 Run repeatedly / in the background:
   ssl_checker.py -f sites.txt --every 6h --background       (every 6 hours, until killed)
@@ -16,6 +19,70 @@ Run repeatedly / in the background:
 
 NOTE: --background only works on Linux/Unix (it uses fork). On Windows, run the script in a
 foreground terminal or use Task Scheduler instead.
+
+NOTES - revocation checking (--check-revocation)
+------------------------------------------------
+Why: a certificate can be revoked by its CA before its expiry date (stolen key, mis-issued
+cert). Python's ssl module only checks the chain, hostname and dates - NOT revocation - so
+a revoked cert can look "OK" here while Chrome/Firefox block it. This flag closes that gap.
+
+What is an OCSP responder? A server run by the CA (OCSP = Online Certificate Status
+Protocol). A client sends it a certificate's serial number + issuer, and it returns a signed
+answer: good, revoked (with time/reason) or unknown. The responder URL is stored in the
+certificate's "Authority Information Access" field.
+What is a CRL? A downloadable list of every revoked serial number from a CA. The URL is in
+the certificate's "CRL Distribution Points" field. Larger and slower than OCSP, but it works
+when a CA has no OCSP responder (e.g. Let's Encrypt has dropped OCSP in favour of CRLs).
+
+How the script does it (needs the `openssl` CLI):
+  1. Normal check first: connect, verify chain/hostname, read the expiry date.
+  2. With --check-revocation, fetch the server's chain (`openssl s_client -showcerts`).
+     The first cert is the site (leaf), the second is its issuer.
+  3. OCSP: if the leaf lists a responder, ask it (`openssl ocsp`) about the leaf's serial.
+       revoked -> status REVOKED     good -> OK     no answer -> try the CRL
+  4. CRL fallback: download the CRL from the leaf's CRL address and look for the leaf's
+     serial number in it. Listed -> REVOKED, not listed -> OK.
+  5. If nothing could be checked (no OCSP/CRL address, responder down, no openssl), the
+     site stays OK but the message says "(revocation not verified: ...)". A failed check is
+     never reported as a clean result.
+  Certificates that already fail verification (invalid, incomplete chain) skip this step.
+
+Status meanings: REVOKED = the CA revoked it (alerts + exit code 1, like EXPIRED).
+Limits: this only reflects what the CA publishes. Chrome's CRLSets and Firefox's CRLite
+can flag a cert earlier, so a browser may still block a site that this script shows as OK.
+It adds a few seconds per site, which is why it is opt-in.
+
+NOTES - webhooks (--webhook, env SSL_WEBHOOKS)
+----------------------------------------------
+--webhook is repeatable and the service is detected from the URL: telegram://BOT_TOKEN@CHAT_ID,
+Discord, Slack/Mattermost, Teams, or any other URL (generic JSON). To support another
+messenger, add one (matcher, builder) entry to FORMATTERS. Failures are logged without the
+URL, so bot tokens stay out of logs.
+
+NOTES - running in the background on Linux
+------------------------------------------
+1) Built-in (quick, does NOT survive a reboot):
+     ssl_checker.py -f sites.txt --check-revocation --every 6h --background
+     ssl_checker.py -f sites.txt --check-revocation --at 09:00 --for 30d --background
+   Output goes to ssl_checker.log (--log-file), PID to ssl_checker.pid (--pid-file).
+   Watch: tail -f ssl_checker.log      Stop: kill $(cat ssl_checker.pid)
+   Tip: put the webhook in the environment instead of the command line, so the bot token
+   is not visible in `ps`:  export SSL_WEBHOOKS="telegram://BOT_TOKEN@CHAT_ID"
+2) cron (survives reboots) - `crontab -e`, use absolute paths:
+     0 */6 * * * SSL_WEBHOOKS="telegram://BOT_TOKEN@CHAT_ID" /usr/bin/python3 /path/ssl_checker.py -f /path/sites.txt --check-revocation >> /path/cron.log 2>&1
+3) systemd user service (survives reboots, restarts on crash) - recommended for permanent use.
+   Create ~/.config/systemd/user/ssl-checker.service:
+     [Service]
+     WorkingDirectory=/path/to/SSLChecker
+     Environment=SSL_WEBHOOKS=telegram://BOT_TOKEN@CHAT_ID
+     ExecStart=/usr/bin/python3 ssl_checker.py -f sites.txt --check-revocation --every 6h
+     Restart=on-failure
+     [Install]
+     WantedBy=default.target
+   Then: systemctl --user daemon-reload && systemctl --user enable --now ssl-checker
+         loginctl enable-linger $USER          (keep running after logout)
+         journalctl --user -u ssl-checker -f   (logs)
+   Do not use --background under systemd; it already runs the process in the background.
 
 Exit code: 0 = all OK, 1 = at least one WARNING/EXPIRED/INVALID/ERROR.
 Suitable for cron:  0 */6 * * * /usr/bin/python3 /path/ssl_checker.py -f sites.txt --webhook URL
@@ -128,9 +195,93 @@ def decode_cert(pem, txt_path):
         fh.write(out)
 
 
-def check(target, timeout, warn_days, dump_dir=None):
+def _openssl(args, stdin=None, timeout=15, binary=False):
+    """Run the openssl CLI; returns (returncode, stdout, stderr). Raises OSError/SubprocessError."""
+    r = subprocess.run(["openssl"] + args, input=stdin, capture_output=True, timeout=timeout,
+                       text=not binary)
+    return r.returncode, r.stdout, r.stderr
+
+
+def fetch_chain_pem(host, port, timeout):
+    """Return the server-sent certificates as a list of PEM strings (leaf first)."""
+    _, out, _ = _openssl(["s_client", "-connect", f"{host}:{port}", "-servername", host, "-showcerts"],
+                         stdin="", timeout=timeout + 5)
+    return re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", out, re.S)
+
+
+def check_revocation(host, port, timeout):
+    """Check revocation via OCSP, falling back to the CRL. Returns (state, detail) where state is
+    'good', 'revoked' or 'unknown' (no responder, unreachable, or issuer not sent by the server)."""
+    import tempfile
+    try:
+        chain = fetch_chain_pem(host, port, timeout)
+        if not chain:
+            return "unknown", "could not read the certificate chain"
+        leaf = chain[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            leaf_f = os.path.join(tmp, "leaf.pem")
+            open(leaf_f, "w").write(leaf)
+            text = _openssl(["x509", "-noout", "-text", "-serial"], stdin=leaf)[1]
+            serial = re.search(r"^serial=([0-9A-Fa-f]+)", text, re.M).group(1).upper().lstrip("0")
+            ocsp = re.search(r"OCSP - URI:(\S+)", text)
+            crls = re.findall(r"URI:(http\S+\.crl\S*|http\S+)", text.split("CRL Distribution Points")[1]
+                              .split("Authority Information Access")[0]) if "CRL Distribution Points" in text else []
+            reasons = []
+
+            # 1) OCSP (needs the issuer, which servers normally send as the 2nd cert)
+            if ocsp and len(chain) > 1:
+                iss_f = os.path.join(tmp, "issuer.pem")
+                open(iss_f, "w").write(chain[1])
+                url = ocsp.group(1)
+                rc, out, err = _openssl(["ocsp", "-issuer", iss_f, "-cert", leaf_f, "-url", url,
+                                         "-header", "Host", urlparse(url).hostname,
+                                         "-timeout", str(timeout), "-noverify"], timeout=timeout + 5)
+                m = re.search(r"leaf\.pem: (good|revoked|unknown)", out + err)
+                if m and m.group(1) == "revoked":
+                    when = re.search(r"Revocation Time: (.+)", out)
+                    return "revoked", "OCSP: revoked" + (f" on {when.group(1)}" if when else "")
+                if m and m.group(1) == "good":
+                    return "good", "OCSP: good"
+                reasons.append("OCSP gave no answer")
+            elif ocsp:
+                reasons.append("OCSP skipped (issuer cert not sent by server)")
+
+            # 2) CRL fallback
+            for url in crls[:2]:
+                try:
+                    with urllib.request.urlopen(url, timeout=timeout) as resp:
+                        data = resp.read(50_000_000)
+                    fmt = "PEM" if data.lstrip().startswith(b"-----BEGIN") else "DER"
+                    rc, out, err = _openssl(["crl", "-inform", fmt, "-noout", "-text"], stdin=data,
+                                            timeout=60, binary=True)
+                    if rc != 0:
+                        reasons.append("CRL unreadable")
+                        continue
+                    out = out.decode(errors="replace")
+                    for m in re.finditer(r"Serial Number:\s*([0-9A-Fa-f]+)(.*?)(?=Serial Number:|\Z)", out, re.S):
+                        if m.group(1).upper().lstrip("0") == serial:
+                            when = re.search(r"Revocation Date: (.+)", m.group(2))
+                            return "revoked", "CRL: revoked" + (f" on {when.group(1).strip()}" if when else "")
+                    return "good", "CRL: not listed"
+                except (OSError, ValueError) as e:
+                    reasons.append(f"CRL fetch failed ({type(e).__name__})")
+            if not ocsp and not crls:
+                reasons.append("certificate has no OCSP/CRL address")
+            return "unknown", "; ".join(reasons) or "no revocation info"
+    except (OSError, subprocess.SubprocessError, AttributeError) as e:
+        return "unknown", f"revocation check failed ({type(e).__name__}: {e}); is the openssl CLI installed?"
+
+
+def check(target, timeout, warn_days, dump_dir=None, revocation=False):
     result = _check(target, timeout, warn_days)
     result["cert_file"] = ""
+    if revocation and result["host"] and result["status"] in ("OK", "WARNING", "EXPIRED"):
+        state, detail = check_revocation(result["host"], result["port"], timeout)
+        result["revocation"] = detail
+        if state == "revoked":
+            result.update(status="REVOKED", message=detail)
+        elif state == "unknown" and result["status"] == "OK":
+            result["message"] += f" (revocation not verified: {detail})"
     if dump_dir and result["host"] and result["status"] not in ("DNS_ERROR", "ERROR"):
         result["cert_file"] = dump_cert(result["host"], result["port"], timeout, dump_dir)
     return result
@@ -161,8 +312,10 @@ def _check(target, timeout, warn_days):
             result["message"] = f"valid, expires in {days} days"
     except ssl.SSLCertVerificationError as e:
         # 20 = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY: server omitted the intermediate cert
-        status = "INCOMPLETE_CHAIN" if e.verify_code == 20 else "INVALID"
+        status = {20: "INCOMPLETE_CHAIN", 10: "EXPIRED"}.get(e.verify_code, "INVALID")
         message = e.verify_message or str(e)
+        if status == "EXPIRED":
+            message = "certificate has expired"
         if status == "INCOMPLETE_CHAIN":
             message += " (server is not sending the intermediate certificate)"
         result.update(status=status, message=message)
@@ -181,11 +334,43 @@ def _check(target, timeout, warn_days):
     return result
 
 
+def _telegram(url, text):
+    # telegram://BOT_TOKEN@CHAT_ID  ->  Bot API sendMessage
+    u = urlparse(url)
+    token = f"{u.username}:{u.password}" if u.password else u.username
+    return (f"https://api.telegram.org/bot{token}/sendMessage",
+            {"chat_id": u.hostname, "text": text})
+
+
+# To support a new messenger: add (matcher, builder). Builder returns (final_url, json_payload).
+FORMATTERS = [
+    (lambda u: u.startswith("telegram://"), _telegram),
+    (lambda u: "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u,
+     lambda u, t: (u, {"content": t})),
+    (lambda u: "hooks.slack.com" in u or "/hooks/" in u,  # Slack, Mattermost
+     lambda u, t: (u, {"text": t})),
+    (lambda u: "webhook.office.com" in u,  # Microsoft Teams
+     lambda u, t: (u, {"text": t})),
+]
+
+
 def send_webhook(url, text):
-    # {"text": ...} works for Slack and Mattermost; Discord wants "content", so send both.
-    body = json.dumps({"text": text, "content": text}).encode()
-    req = urllib.request.Request(url, body, {"Content-Type": "application/json"})
+    for match, build in FORMATTERS:
+        if match(url):
+            target, payload = build(url, text)
+            break
+    else:  # unknown service: generic JSON
+        target, payload = url, {"text": text, "content": text}
+    req = urllib.request.Request(target, json.dumps(payload).encode(),
+                                 {"Content-Type": "application/json"})
     urllib.request.urlopen(req, timeout=10).close()
+
+
+def webhook_urls(args):
+    """All webhook URLs from repeated --webhook flags plus the SSL_WEBHOOKS env var (comma-separated)."""
+    urls = list(args.webhook or [])
+    urls += [u.strip() for u in os.environ.get("SSL_WEBHOOKS", "").split(",") if u.strip()]
+    return urls
 
 
 def send_email(to, subject, text, host, port, user, password):
@@ -201,7 +386,7 @@ def send_email(to, subject, text, host, port, user, password):
 
 
 COLORS = {"OK": "34",  # blue
-          "INVALID": "31", "EXPIRED": "31", "INCOMPLETE_CHAIN": "31",  # red
+          "REVOKED": "31", "INVALID": "31", "EXPIRED": "31", "INCOMPLETE_CHAIN": "31",  # red
           "WARNING": "33", "ERROR": "33", "DNS_ERROR": "33"}  # yellow
 
 
@@ -256,7 +441,7 @@ def run_once(args):
     """Check all sites once, print results, send alerts. Returns the list of results."""
     sites = load_sites(args)  # re-read each run so edits to the sites file are picked up
     with ThreadPoolExecutor(max_workers=min(20, len(sites))) as pool:
-        results = list(pool.map(lambda s: check(s, args.timeout, args.warn_days, args.dump_cert), sites))
+        results = list(pool.map(lambda s: check(s, args.timeout, args.warn_days, args.dump_cert, args.check_revocation), sites))
 
     print_table(results)
 
@@ -265,11 +450,12 @@ def run_once(args):
         text = "SSL certificate alert:\n" + "\n".join(
             f"- {r['status']}: {r['host']}:{r['port']} - {r['message']}"
             + (f" (issuer: {r['issuer']})" if r["issuer"] else "") for r in problems)
-        if args.webhook:
+        for url in webhook_urls(args):
             try:
-                send_webhook(args.webhook, text)
+                send_webhook(url, text)
             except Exception as e:
-                print(f"webhook failed: {e}", file=sys.stderr)
+                # don't print the URL: it may contain a bot token
+                print(f"webhook failed ({url.split('://')[0]}): {type(e).__name__}: {e}", file=sys.stderr)
         if args.email:
             try:
                 send_email(args.email, f"SSL alert: {len(problems)} problem(s)", text,
@@ -327,7 +513,11 @@ def main():
     p.add_argument("-t", "--timeout", type=float, default=10)
     p.add_argument("--dump-cert", nargs="?", const="certs", metavar="DIR",
                    help="save each site's certificate into DIR (default ./certs) as .pem plus a decoded .txt, even if invalid")
-    p.add_argument("--webhook", help="Slack/Discord/Mattermost webhook URL for alerts")
+    p.add_argument("--webhook", action="append", metavar="URL",
+                   help="webhook URL (repeatable; also env SSL_WEBHOOKS, comma-separated). "
+                        "Slack/Discord/Mattermost/Teams URL, or telegram://BOT_TOKEN@CHAT_ID")
+    p.add_argument("--check-revocation", action="store_true",
+                   help="also check OCSP/CRL revocation (uses the openssl CLI; browsers do this, Python does not)")
     p.add_argument("--email", help="recipient address for alerts")
     p.add_argument("--smtp-host", default=os.environ.get("SMTP_HOST", "localhost"),
                    help="SMTP server (default: $SMTP_HOST or localhost)")

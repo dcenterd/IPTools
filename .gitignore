@@ -2,3 +2,6 @@ CLAUDE.md
 __pycache__/
 *.pyc
 iplookup-results/
+ssl_checker.state.json
+ssl_checker.log
+ssl_checker.pid

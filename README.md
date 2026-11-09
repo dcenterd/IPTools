@@ -16,7 +16,7 @@ Most scripts query public data sources ([RIPEstat](https://stat.ripe.net), the R
 | `country2subnet.py` | Builds IPv4 prefix lists for one or more countries from the delegated statistics of all five RIRs. Writes plain lists and MikroTik `.rsc` files. |
 | `mikrotik_subnet_updater.py` | Syncs a country's prefix list into a MikroTik firewall address-list through the RouterOS REST API (adds missing, removes stale, asks before changing anything). |
 | `ripe_ip_checker.py` | Pre-purchase due-diligence report for IPv4 ranges in the RIPE region: ownership, transfers, routing history, RPKI/IRR, reputation, geolocation, past usage, compliance and fragmentation. |
-| `ssl_checker.py` | Checks the SSL/TLS certificate of one or many websites: expiry, invalid/self-signed/wrong-host certificates, missing intermediate (incomplete chain) and DNS failures. Shows a table with issuer and days left, can alert by webhook or e-mail, run on a schedule in the background, and dump certificates as PEM plus decoded text. |
+| `ssl_checker.py` | Checks the SSL/TLS certificate of one or many websites: expiry, invalid/self-signed/wrong-host certificates, missing intermediate (incomplete chain) and DNS failures. Shows a table with issuer and days left, can alert by webhook or e-mail, run on a schedule in the background, and dump certificates as PEM plus decoded text. In scheduled mode it keeps a state file and reports (and alerts) only when a site's status changes or its certificate is replaced, so unchanged runs stay silent. |
 | `cve_checker.py` | Latest published CVEs from NVD and CIRCL, ranked by real-world risk: CISA KEV (exploited now) first, then EPSS exploitation probability, then CVSS score. Filter by days, keyword, severity or score; table or JSON output. |
 | `ipx.py` | All-in-one network diagnostics (Linux, no root needed): traceroute over ICMP or UDP, with per-hop ASN/org/country (`--asn`), path MTU discovery (`--mtu`), protocol/host comparison (`--compare`), live per-hop stats with sparklines (`--live`), ping with stats (`--ping`, or a TCP port ping with `--ping --port N` when ICMP is blocked), an nc-style TCP/UDP port check (`--port N`), an `nc -l` style TCP listener (`-l PORT`) and port scan (`--scan`, `--open`). Uses only the standard library. A single-binary Go port lives in [`ipx-go/`](ipx-go/) (prebuilt Linux amd64/arm64 on the [Releases](https://github.com/dcenterd/IPTools/releases) page). |
 | `pcap_analyzer.py` | Packet-capture debugger (`.pcap`, `.pcapng`, `.gz`; standard library only). Text dashboard or `--html` report with charts, a conversation map and clickable per-host cards (clickable traffic-over-time bars with per-window details, KPI cards and donut slices that jump to their sections, networks table with linked IPs, back-to-top button); `--json`. Covers layers 1-7 plus: **expert findings with packet numbers and ready-to-paste Wireshark filters**; per-flow TCP health (handshake/RTT, retransmissions, dup-ACKs, zero-window, resets) with ladder diagrams, throughput and sequence graphs; latency tables (TCP handshake, DNS, TLS, HTTP); path/MTU checks (MSS, ICMP fragmentation-needed, PMTU black holes); L2 discovery (LLDP/CDP neighbours, STP changes, DHCP problems, ARP sweeps/storms, duplicate IPs, broadcast storms); TLS certificates (expiry, self-signed, weak key/signature, name mismatch), JA3 fingerprints and beaconing detection; `--whois` for ASN/org/country. Filters (`--host --port --proto --flow --from --to`) narrow the analysis and `--extract` writes the selection to a new pcap. |
@@ -72,6 +72,7 @@ pip install -r requirements.txt
 ./ssl_checker.py github.com example.org:8443
 ./ssl_checker.py -f sites.txt --warn-days 30 --dump-cert certs
 ./ssl_checker.py -f sites.txt --every 6h --background --webhook <url>
+SSL_WEBHOOKS=<url> ./ssl_checker.py -f sites.txt --check-revocation --every 6h   # alerts only on changes
 
 # analyze a capture (top IPs, protocols, layers 1-7, findings)
 ./pcap_analyzer.py capture.pcap -n 15 -o report.txt
@@ -116,6 +117,7 @@ pip install -r requirements.txt
 
 - `pip install cryptography` lets it show issuer and expiry even for certificates that fail verification.
 - The `openssl` command-line tool is used for the decoded `.txt` written by `--dump-cert`.
+- Change detection state is stored in `ssl_checker.state.json` (`--state-file`); delete it to start fresh. Use `--verbose` to print the full table on every run. See the notes at the top of the script for a systemd service setup.
 - E-mail alerts use `--smtp-host/--smtp-port/--smtp-user/--smtp-pass` (or the `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` environment variables).
 
 ### Optional API keys for `ripe_ip_checker.py`

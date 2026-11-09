@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 # Written by Zareh
 # Gifted to Seyed Mesbah Ahmadi
-"""Check SSL certificate validity/expiry for one or many websites and alert on problems.
+"""Check SSL certificate validity/expiry/revocation for many websites and report only CHANGES.
+
+QUICK START (permanent setup on Linux, alerts to Telegram/Discord/Slack/Teams/any webhook)
+  1. sites.txt - one site per line (re-read every run, so edits need no restart).
+  2. Put the webhook in a private env file (NOT on the command line, `ps` would show it):
+       mkdir -p ~/.config/ssl-checker
+       echo 'SSL_WEBHOOKS=telegram://BOT_TOKEN@CHAT_ID' > ~/.config/ssl-checker/env
+       chmod 600 ~/.config/ssl-checker/env
+  3. Run it as a systemd user service - see "NOTES - running in the background", option 3.
+  4. Test the webhook once:  SSL_WEBHOOKS=... python3 -c "import ssl_checker as m, os; \\
+       m.send_webhook(os.environ['SSL_WEBHOOKS'], 'ssl-checker test')"
+  You are notified only when something changes (see "NOTES - change detection"); an
+  unchanged site produces no output and no alert.
 
 Usage:
   ssl_checker.py example.com https://github.com:443
@@ -19,6 +31,16 @@ Run repeatedly / in the background:
 
 NOTE: --background only works on Linux/Unix (it uses fork). On Windows, run the script in a
 foreground terminal or use Task Scheduler instead.
+
+NOTES - change detection (state file)
+-------------------------------------
+Each run is compared with the previous one (saved in --state-file). Output and alerts happen
+only when something CHANGED: status (OK -> REVOKED/EXPIRED/INVALID/..., or back to OK =
+RECOVERED), or the certificate was replaced (new SHA-256 fingerprint, e.g. a renewal). A
+problem present on the very first run is reported once; an unchanged problem is not repeated.
+Day counters do not count as changes. If every alert channel fails, the change is kept
+pending and re-sent next run. Use --verbose for the old print-everything behavior; delete the
+state file to start fresh. The exit code still reflects the current state (1 = a problem exists).
 
 NOTES - revocation checking (--check-revocation)
 ------------------------------------------------
@@ -66,23 +88,32 @@ NOTES - running in the background on Linux
      ssl_checker.py -f sites.txt --check-revocation --at 09:00 --for 30d --background
    Output goes to ssl_checker.log (--log-file), PID to ssl_checker.pid (--pid-file).
    Watch: tail -f ssl_checker.log      Stop: kill $(cat ssl_checker.pid)
+   The state file (ssl_checker.state.json) is created in the current directory.
    Tip: put the webhook in the environment instead of the command line, so the bot token
    is not visible in `ps`:  export SSL_WEBHOOKS="telegram://BOT_TOKEN@CHAT_ID"
-2) cron (survives reboots) - `crontab -e`, use absolute paths:
-     0 */6 * * * SSL_WEBHOOKS="telegram://BOT_TOKEN@CHAT_ID" /usr/bin/python3 /path/ssl_checker.py -f /path/sites.txt --check-revocation >> /path/cron.log 2>&1
+2) cron (survives reboots) - `crontab -e`, use absolute paths. cron starts in your home
+   directory, so ALWAYS pass an absolute --state-file or change detection loses its memory:
+     0 */6 * * * SSL_WEBHOOKS="telegram://BOT_TOKEN@CHAT_ID" /usr/bin/python3 /path/ssl_checker.py -f /path/sites.txt --check-revocation --state-file /path/ssl_checker.state.json >> /path/cron.log 2>&1
 3) systemd user service (survives reboots, restarts on crash) - recommended for permanent use.
    Create ~/.config/systemd/user/ssl-checker.service:
+     [Unit]
+     Description=SSL certificate change checker
      [Service]
      WorkingDirectory=/path/to/SSLChecker
-     Environment=SSL_WEBHOOKS=telegram://BOT_TOKEN@CHAT_ID
+     EnvironmentFile=%h/.config/ssl-checker/env
      ExecStart=/usr/bin/python3 ssl_checker.py -f sites.txt --check-revocation --every 6h
      Restart=on-failure
+     RestartSec=300
      [Install]
      WantedBy=default.target
-   Then: systemctl --user daemon-reload && systemctl --user enable --now ssl-checker
+   Then (stop any --background instance first: kill $(cat ssl_checker.pid)):
+         systemctl --user daemon-reload && systemctl --user enable --now ssl-checker
          loginctl enable-linger $USER          (keep running after logout)
          journalctl --user -u ssl-checker -f   (logs)
    Do not use --background under systemd; it already runs the process in the background.
+   RestartSec=300 matters: the script exits when a site is unreachable (DNS_ERROR/ERROR), and
+   without a delay systemd would restart it in a tight loop. Fix or remove the site to stop it.
+   To force a test alert: stop the service, edit a site's "status" in the state file, start it.
 
 Exit code: 0 = all OK, 1 = at least one WARNING/EXPIRED/INVALID/ERROR.
 Suitable for cron:  0 */6 * * * /usr/bin/python3 /path/ssl_checker.py -f sites.txt --webhook URL
@@ -91,6 +122,7 @@ The --smtp-* flags default to the env vars SMTP_HOST, SMTP_PORT (587), SMTP_USER
 Optional sender address: SMTP_FROM (defaults to the SMTP user).
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -99,6 +131,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -160,7 +193,8 @@ def inspect_unverified(host, port, timeout):
     expires = getattr(cert, "not_valid_after_utc", None)
     if expires is None:  # cryptography < 42
         expires = cert.not_valid_after.replace(tzinfo=timezone.utc)
-    return {"issuer": format_issuer(issuer), "expires": expires}
+    return {"issuer": format_issuer(issuer), "expires": expires,
+            "fingerprint": hashlib.sha256(der).hexdigest()}
 
 
 def dump_cert(host, port, timeout, out_dir):
@@ -290,7 +324,8 @@ def check(target, timeout, warn_days, dump_dir=None, revocation=False):
 def _check(target, timeout, warn_days):
     host, port = parse_target(target)
     result = {"target": target, "host": host, "port": port, "status": "OK",
-              "days_left": None, "expires": None, "issuer": "", "message": ""}
+              "days_left": None, "expires": None, "issuer": "", "message": "",
+              "fingerprint": ""}
     if not host:
         result.update(status="ERROR", message="could not parse host")
         return result
@@ -300,6 +335,7 @@ def _check(target, timeout, warn_days):
         with socket.create_connection((host, port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname=host) as tls:
                 cert = tls.getpeercert()
+                result["fingerprint"] = hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()
         expires = datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), timezone.utc)
         days = (expires - datetime.now(timezone.utc)).days
         result.update(expires=expires.strftime("%Y-%m-%d"), days_left=days,
@@ -322,7 +358,8 @@ def _check(target, timeout, warn_days):
         info = inspect_unverified(host, port, timeout)
         if info:
             result.update(issuer=info["issuer"], expires=info["expires"].strftime("%Y-%m-%d"),
-                          days_left=(info["expires"] - datetime.now(timezone.utc)).days)
+                          days_left=(info["expires"] - datetime.now(timezone.utc)).days,
+                          fingerprint=info["fingerprint"])
     except ssl.SSLError as e:
         result.update(status="INVALID", message=f"SSL error: {e}")
     except (socket.timeout, TimeoutError):
@@ -437,31 +474,104 @@ def print_table(results):
             print(f"certificate saved: {r['cert_file']} (+ decoded .txt)")
 
 
+def load_state(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}  # missing or corrupt: treat as a first run
+
+
+def save_state(path, state):
+    """Atomic write so a crash mid-save cannot corrupt the state file."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".ssl_state_")
+    with os.fdopen(fd, "w") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def detect_changes(results, state):
+    """Compare results with the saved state. Returns list of (result, headline) for hosts that changed.
+
+    Changed means: status differs (OK->REVOKED, EXPIRED->OK, ...), the certificate itself was
+    replaced (new fingerprint), or a problem was seen on the very first run. Day counters and
+    message text are ignored, so 'expires in 9 days' -> 'expires in 8 days' is not a change.
+    """
+    changes = []
+    for r in results:
+        key = f"{r['host']}:{r['port']}"
+        old = state.get(key)
+        if old is None:
+            if r["status"] != "OK":
+                changes.append((r, f"NEW PROBLEM: {r['status']}"))
+        elif old["status"] != r["status"]:
+            kind = "RECOVERED" if r["status"] == "OK" else "CHANGED"
+            changes.append((r, f"{kind}: {old['status']} -> {r['status']}"))
+        elif old.get("fingerprint") and r["fingerprint"] and old["fingerprint"] != r["fingerprint"]:
+            changes.append((r, "CERTIFICATE REPLACED (new certificate, expires "
+                               f"{r['expires']}, was {old.get('expires')})"))
+    return changes
+
+
+def notify(args, text):
+    """Send text to every webhook/email. Returns True if nothing was configured or at least one succeeded."""
+    ok, tried = False, False
+    for url in webhook_urls(args):
+        tried = True
+        try:
+            send_webhook(url, text)
+            ok = True
+        except Exception as e:
+            # don't print the URL: it may contain a bot token
+            print(f"webhook failed ({url.split('://')[0]}): {type(e).__name__}: {e}", file=sys.stderr)
+    if args.email:
+        tried = True
+        try:
+            send_email(args.email, "SSL certificate change", text,
+                       args.smtp_host, args.smtp_port, args.smtp_user, args.smtp_pass)
+            ok = True
+        except Exception as e:
+            print(f"email failed: {e}", file=sys.stderr)
+    return ok or not tried
+
+
 def run_once(args):
     """Check all sites once, print results, send alerts. Returns the list of results."""
     sites = load_sites(args)  # re-read each run so edits to the sites file are picked up
     with ThreadPoolExecutor(max_workers=min(20, len(sites))) as pool:
         results = list(pool.map(lambda s: check(s, args.timeout, args.warn_days, args.dump_cert, args.check_revocation), sites))
 
-    print_table(results)
+    state = load_state(args.state_file)
+    changes = detect_changes(results, state)
+    first_run = not state
 
-    problems = [r for r in results if r["status"] != "OK"]
-    if problems:
-        text = "SSL certificate alert:\n" + "\n".join(
-            f"- {r['status']}: {r['host']}:{r['port']} - {r['message']}"
-            + (f" (issuer: {r['issuer']})" if r["issuer"] else "") for r in problems)
-        for url in webhook_urls(args):
-            try:
-                send_webhook(url, text)
-            except Exception as e:
-                # don't print the URL: it may contain a bot token
-                print(f"webhook failed ({url.split('://')[0]}): {type(e).__name__}: {e}", file=sys.stderr)
-        if args.email:
-            try:
-                send_email(args.email, f"SSL alert: {len(problems)} problem(s)", text,
-                           args.smtp_host, args.smtp_port, args.smtp_user, args.smtp_pass)
-            except Exception as e:
-                print(f"email failed: {e}", file=sys.stderr)
+    if args.verbose or first_run or changes:
+        print(f"=== {datetime.now():%Y-%m-%d %H:%M:%S} ===", flush=True)
+        print_table(results)
+    if changes:
+        for r, headline in changes:
+            print(f"{datetime.now():%H:%M:%S} {headline}: {r['host']}:{r['port']} - {r['message']}", flush=True)
+
+    delivered = True
+    if changes:
+        text = "SSL certificate change:\n" + "\n".join(
+            f"- {headline}: {r['host']}:{r['port']} - {r['message']}"
+            + (f" (issuer: {r['issuer']})" if r["issuer"] else "") for r, headline in changes)
+        delivered = notify(args, text)
+
+    # Remember the new state. If every alert channel failed, keep the old state of the changed
+    # hosts so the change is reported again on the next run instead of being lost.
+    changed_keys = {f"{r['host']}:{r['port']}" for r, _ in changes}
+    for r in results:
+        key = f"{r['host']}:{r['port']}"
+        if delivered or key not in changed_keys:
+            state[key] = {"status": r["status"], "fingerprint": r["fingerprint"],
+                          "expires": r["expires"], "issuer": r["issuer"], "message": r["message"],
+                          "checked": datetime.now().isoformat(timespec="seconds")}
+    try:
+        save_state(args.state_file, state)
+    except OSError as e:
+        print(f"could not save state file: {e}", file=sys.stderr)
     return results
 
 
@@ -527,6 +637,11 @@ def main():
                    help="SMTP login (default: $SMTP_USER)")
     p.add_argument("--smtp-pass", default=os.environ.get("SMTP_PASS"),
                    help="SMTP password (default: $SMTP_PASS; prefer the env var, args show up in `ps`)")
+    p.add_argument("--state-file", default="ssl_checker.state.json",
+                   help="remembers each site's last status/certificate so only CHANGES are reported "
+                        "(default ssl_checker.state.json)")
+    p.add_argument("--verbose", action="store_true",
+                   help="print the full table on every run, not only on first run / changes")
     sched = p.add_argument_group("scheduling")
     when = sched.add_mutually_exclusive_group()
     when.add_argument("--every", type=parse_duration, metavar="DURATION",
@@ -549,6 +664,7 @@ def main():
         p.error("--background only works on Linux/Unix; run in a terminal or use Task Scheduler instead")
     if args.background:
         args.log_file, args.pid_file = os.path.abspath(args.log_file), os.path.abspath(args.pid_file)
+        args.state_file = os.path.abspath(args.state_file)
         if args.file:
             args.file = os.path.abspath(args.file)
         if daemonize(args.log_file, args.pid_file):
@@ -566,7 +682,6 @@ def main():
                 if deadline and time.time() + wait > deadline:
                     break
                 time.sleep(wait)
-            print(f"=== {datetime.now():%Y-%m-%d %H:%M:%S} ===", flush=True)
             results = run_once(args)
             any_problem = any(r["status"] != "OK" for r in results)
             broken = [r for r in results if r["status"] in ("DNS_ERROR", "ERROR")]

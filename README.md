@@ -117,6 +117,7 @@ SSL_WEBHOOKS=<url> ./ssl_checker.py -f sites.txt --check-revocation --every 6h  
 
 - `pip install cryptography` lets it show issuer and expiry even for certificates that fail verification.
 - The `openssl` command-line tool is used for the decoded `.txt` written by `--dump-cert`.
+- Webhook targets (`--webhook`, repeatable, or the `SSL_WEBHOOKS` env var): Discord/Slack/Mattermost/Teams/Google Chat/Rocket.Chat webhook URLs, or bot-style URLs `telegram://TOKEN@CHAT_ID`, `bale://TOKEN@CHAT_ID`, `slack-bot://TOKEN@CHANNEL_ID`, `discord-bot://TOKEN@CHANNEL_ID`, `matrix://TOKEN@HOST/ROOM_ID`, `ntfy://TOPIC`, `pushover://APP_TOKEN@USER_KEY`, `gotify://APP_TOKEN@HOST`.
 - Change detection state is stored in `ssl_checker.state.json` (`--state-file`); delete it to start fresh. Use `--verbose` to print the full table on every run. See the notes at the top of the script for a systemd service setup.
 - E-mail alerts use `--smtp-host/--smtp-port/--smtp-user/--smtp-pass` (or the `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` environment variables).
 

@@ -76,10 +76,25 @@ It adds a few seconds per site, which is why it is opt-in.
 
 NOTES - webhooks (--webhook, env SSL_WEBHOOKS)
 ----------------------------------------------
---webhook is repeatable and the service is detected from the URL: telegram://BOT_TOKEN@CHAT_ID,
-Discord, Slack/Mattermost, Teams, or any other URL (generic JSON). To support another
-messenger, add one (matcher, builder) entry to FORMATTERS. Failures are logged without the
-URL, so bot tokens stay out of logs.
+--webhook is repeatable and the service is detected from the URL.
+
+Plain webhook URLs (the URL already identifies the channel, no chat ID needed):
+  Discord, Slack/Mattermost incoming webhooks, Microsoft Teams, or any other URL (generic JSON).
+
+Bot-token URLs (token + target ID in one URL, like Telegram; the ID is case-sensitive):
+  telegram://BOT_TOKEN@CHAT_ID                   e.g. telegram://123456:ABC-DEF@-1001234567890
+  slack-bot://xoxb-TOKEN@CHANNEL_ID              e.g. slack-bot://xoxb-1-2-abc@C0123ABCDEF
+        (Slack app with chat:write, invited to the channel; Slack errors are detected)
+  discord-bot://BOT_TOKEN@CHANNEL_ID             bot needs Send Messages in that channel
+  matrix://ACCESS_TOKEN@HOMESERVER/ROOM_ID       e.g. matrix://syt_abc@matrix.org/!room:matrix.org
+        (quote the URL in the shell: "!" is special)
+  bale://BOT_TOKEN@CHAT_ID                       Bale messenger, same bot API as Telegram
+  ntfy://TOPIC  or  ntfy://[TOKEN@]HOST/TOPIC    ntfy.sh (or your server); subscribe to the topic in the app
+  pushover://APP_TOKEN@USER_KEY                  Pushover push notifications
+  gotify://APP_TOKEN@HOST                        your own Gotify server (https)
+Also plain webhook URLs: Google Chat (chat.googleapis.com), Rocket.Chat (.../hooks/...).
+To support another messenger, add one (matcher, builder) entry to FORMATTERS. Failures are
+logged without the URL, so bot tokens stay out of logs.
 
 NOTES - running in the background on Linux
 ------------------------------------------
@@ -137,7 +152,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 def parse_target(raw):
@@ -371,17 +386,95 @@ def _check(target, timeout, warn_days):
     return result
 
 
-def _telegram(url, text):
+def _telegram(url, text, api="https://api.telegram.org"):
     # telegram://BOT_TOKEN@CHAT_ID  ->  Bot API sendMessage
     u = urlparse(url)
     token = f"{u.username}:{u.password}" if u.password else u.username
-    return (f"https://api.telegram.org/bot{token}/sendMessage",
-            {"chat_id": u.hostname, "text": text})
+    return (f"{api}/bot{token}/sendMessage", {"chat_id": u.hostname, "text": text[:4096]})
 
 
-# To support a new messenger: add (matcher, builder). Builder returns (final_url, json_payload).
+def _bale(url, text):
+    # bale://BOT_TOKEN@CHAT_ID  ->  Bale's Bot API, same format as Telegram's
+    return _telegram(url, text, api="https://tapi.bale.ai")
+
+
+def _split_target(url):
+    """'scheme://TOKEN@TARGET' -> (TOKEN, TARGET), keeping case (URL parsing would lowercase IDs)."""
+    token, _, target = url.split("://", 1)[1].rpartition("@")
+    if not token or not target:
+        raise ValueError(f"expected {url.split('://')[0]}://TOKEN@TARGET")
+    return token, target
+
+
+def _slack_bot(url, text):
+    # slack-bot://xoxb-TOKEN@CHANNEL_ID  ->  chat.postMessage (bot needs chat:write, invited to channel)
+    token, channel = _split_target(url)
+
+    def check(body):  # Slack answers HTTP 200 even on errors; the real result is in the JSON
+        if not json.loads(body).get("ok"):
+            raise RuntimeError(f"Slack error: {json.loads(body).get('error', 'unknown')}")
+    return ("https://slack.com/api/chat.postMessage", {"channel": channel, "text": text},
+            {"headers": {"Authorization": f"Bearer {token}"}, "check": check})
+
+
+def _discord_bot(url, text):
+    # discord-bot://BOT_TOKEN@CHANNEL_ID  ->  create message (bot needs Send Messages in that channel)
+    token, channel = _split_target(url)
+    return (f"https://discord.com/api/v10/channels/{channel}/messages", {"content": text[:2000]},
+            {"headers": {"Authorization": f"Bot {token}", "User-Agent": "ssl-checker (script, 1.0)"}})
+
+
+def _ntfy(url, text):
+    # ntfy://TOPIC  |  ntfy://[ACCESS_TOKEN@]HOST/TOPIC  (default server ntfy.sh)  ->  JSON publish
+    rest = url.split("://", 1)[1]
+    token, _, rest = rest.rpartition("@")
+    server, _, topic = rest.rpartition("/")
+    if not topic:
+        raise ValueError("expected ntfy://[TOKEN@][HOST/]TOPIC")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return (f"https://{server or 'ntfy.sh'}/", {"topic": topic, "title": "SSL checker", "message": text},
+            {"headers": headers})
+
+
+def _pushover(url, text):
+    # pushover://APP_TOKEN@USER_OR_GROUP_KEY
+    token, user = _split_target(url)
+    return ("https://api.pushover.net/1/messages.json",
+            {"token": token, "user": user, "title": "SSL checker", "message": text[:1024]})
+
+
+def _gotify(url, text):
+    # gotify://APP_TOKEN@HOST  (your own Gotify server, https)
+    token, host = _split_target(url)
+    return (f"https://{host}/message?token={quote(token, safe='')}",
+            {"title": "SSL checker", "message": text, "priority": 5})
+
+
+def _matrix(url, text):
+    # matrix://ACCESS_TOKEN@homeserver.example/!ROOM_ID:homeserver.example  ->  send m.room.message
+    token, target = _split_target(url)
+    server, _, room = target.partition("/")
+    if not room:
+        raise ValueError("expected matrix://ACCESS_TOKEN@HOMESERVER/ROOM_ID")
+    txn = f"sslchecker{time.time_ns()}"
+    return (f"https://{server}/_matrix/client/v3/rooms/{quote(room, safe='')}/send/m.room.message/{txn}",
+            {"msgtype": "m.text", "body": text},
+            {"headers": {"Authorization": f"Bearer {token}"}, "method": "PUT"})
+
+
+# To support a new messenger: add (matcher, builder). Builder returns (final_url, json_payload)
+# and may add a third item: {"headers": {...}, "method": "PUT", "check": fn(response_body)}.
 FORMATTERS = [
     (lambda u: u.startswith("telegram://"), _telegram),
+    (lambda u: u.startswith("slack-bot://"), _slack_bot),
+    (lambda u: u.startswith("discord-bot://"), _discord_bot),
+    (lambda u: u.startswith("matrix://"), _matrix),
+    (lambda u: u.startswith("bale://"), _bale),
+    (lambda u: u.startswith("ntfy://"), _ntfy),
+    (lambda u: u.startswith("pushover://"), _pushover),
+    (lambda u: u.startswith("gotify://"), _gotify),
+    (lambda u: "chat.googleapis.com" in u,  # Google Chat incoming webhook
+     lambda u, t: (u, {"text": t})),
     (lambda u: "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u,
      lambda u, t: (u, {"content": t})),
     (lambda u: "hooks.slack.com" in u or "/hooks/" in u,  # Slack, Mattermost
@@ -394,13 +487,18 @@ FORMATTERS = [
 def send_webhook(url, text):
     for match, build in FORMATTERS:
         if match(url):
-            target, payload = build(url, text)
+            target, payload, *extra = build(url, text)
             break
     else:  # unknown service: generic JSON
-        target, payload = url, {"text": text, "content": text}
+        target, payload, extra = url, {"text": text, "content": text}, []
+    opts = extra[0] if extra else {}
     req = urllib.request.Request(target, json.dumps(payload).encode(),
-                                 {"Content-Type": "application/json"})
-    urllib.request.urlopen(req, timeout=10).close()
+                                 {"Content-Type": "application/json", **opts.get("headers", {})},
+                                 method=opts.get("method", "POST"))
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = resp.read()
+    if "check" in opts:
+        opts["check"](body)
 
 
 def webhook_urls(args):
@@ -625,7 +723,10 @@ def main():
                    help="save each site's certificate into DIR (default ./certs) as .pem plus a decoded .txt, even if invalid")
     p.add_argument("--webhook", action="append", metavar="URL",
                    help="webhook URL (repeatable; also env SSL_WEBHOOKS, comma-separated). "
-                        "Slack/Discord/Mattermost/Teams URL, or telegram://BOT_TOKEN@CHAT_ID")
+                        "Slack/Discord/Mattermost/Teams URL, or a bot: telegram://BOT_TOKEN@CHAT_ID, "
+                        "slack-bot://TOKEN@CHANNEL_ID, discord-bot://TOKEN@CHANNEL_ID, "
+                        "matrix://TOKEN@HOMESERVER/ROOM_ID, bale://TOKEN@CHAT_ID, ntfy://TOPIC, "
+                        "pushover://APP_TOKEN@USER_KEY, gotify://APP_TOKEN@HOST")
     p.add_argument("--check-revocation", action="store_true",
                    help="also check OCSP/CRL revocation (uses the openssl CLI; browsers do this, Python does not)")
     p.add_argument("--email", help="recipient address for alerts")

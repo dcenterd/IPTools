@@ -10,8 +10,7 @@ QUICK START (permanent setup on Linux, alerts to Telegram/Discord/Slack/Teams/an
        echo 'SSL_WEBHOOKS=telegram://BOT_TOKEN@CHAT_ID' > ~/.config/ssl-checker/env
        chmod 600 ~/.config/ssl-checker/env
   3. Run it as a systemd user service - see "NOTES - running in the background", option 3.
-  4. Test the webhook once:  SSL_WEBHOOKS=... python3 -c "import ssl_checker as m, os; \\
-       m.send_webhook(os.environ['SSL_WEBHOOKS'], 'ssl-checker test')"
+  4. Test the webhook once:  set -a; . ~/.config/ssl-checker/env; set +a; ssl_checker.py --test-webhook
   You are notified only when something changes (see "NOTES - change detection"); an
   unchanged site produces no output and no alert.
 
@@ -24,6 +23,7 @@ Usage:
       --smtp-port 587 --smtp-user you@gmail.com --smtp-pass APP_PASSWORD
 
   ssl_checker.py -f sites.txt --check-revocation --webhook ...
+  ssl_checker.py --test-webhook --webhook URL      (send a test alert to every webhook/email, then exit)
 
 Run repeatedly / in the background:
   ssl_checker.py -f sites.txt --every 6h --background       (every 6 hours, until killed)
@@ -633,6 +633,35 @@ def notify(args, text):
     return ok or not tried
 
 
+def test_notifications(args):
+    """Send a test message to every configured webhook/email and report each result. Returns True if all succeeded."""
+    text = f"ssl-checker test message from {socket.gethostname()} - alerts are working."
+    targets = webhook_urls(args)
+    if not targets and not args.email:
+        print("nothing to test: give --webhook URL, set SSL_WEBHOOKS, or use --email", file=sys.stderr)
+        return False
+    all_ok = True
+    for url in targets:
+        name = url.split("://")[0] if "://" in url else "webhook"  # never print the URL: it may hold a token
+        if name in ("http", "https"):
+            name = urlparse(url).hostname or name
+        try:
+            send_webhook(url, text)
+            print(f"[OK]     {name}")
+        except Exception as e:
+            all_ok = False
+            print(f"[FAILED] {name}: {type(e).__name__}: {e}")
+    if args.email:
+        try:
+            send_email(args.email, "SSL checker test", text,
+                       args.smtp_host, args.smtp_port, args.smtp_user, args.smtp_pass)
+            print(f"[OK]     email to {args.email}")
+        except Exception as e:
+            all_ok = False
+            print(f"[FAILED] email to {args.email}: {type(e).__name__}: {e}")
+    return all_ok
+
+
 def run_once(args):
     """Check all sites once, print results, send alerts. Returns the list of results."""
     sites = load_sites(args)  # re-read each run so edits to the sites file are picked up
@@ -727,6 +756,8 @@ def main():
                         "slack-bot://TOKEN@CHANNEL_ID, discord-bot://TOKEN@CHANNEL_ID, "
                         "matrix://TOKEN@HOMESERVER/ROOM_ID, bale://TOKEN@CHAT_ID, ntfy://TOPIC, "
                         "pushover://APP_TOKEN@USER_KEY, gotify://APP_TOKEN@HOST")
+    p.add_argument("--test-webhook", action="store_true",
+                   help="send a test message to every configured webhook (and --email), report the result, and exit")
     p.add_argument("--check-revocation", action="store_true",
                    help="also check OCSP/CRL revocation (uses the openssl CLI; browsers do this, Python does not)")
     p.add_argument("--email", help="recipient address for alerts")
@@ -756,6 +787,8 @@ def main():
     sched.add_argument("--pid-file", default="ssl_checker.pid", help="background PID file (default ssl_checker.pid)")
     args = p.parse_args()
 
+    if args.test_webhook:
+        sys.exit(0 if test_notifications(args) else 1)
     if not load_sites(args):
         p.error("no sites given")
     if args.run_for and not (args.every or args.at):
